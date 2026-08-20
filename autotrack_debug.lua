@@ -16,21 +16,30 @@ local GLOBAL_STATE_NAME = "__nt_autotrack_bot_debug"
 local SCREEN_GUI_NAME = "AutoTrackBotDebugMobile"
 local MOVE_BIND_NAME = "NT_AutoTrackMovement_" .. tostring(LocalPlayer.UserId)
 
-local MIN_STOP_DISTANCE = 2
-local MAX_STOP_DISTANCE = 3.5
-local DISTANCE_BIAS_POWER = 0.38
+local MIN_STOP_DISTANCE = 1
+local MAX_STOP_DISTANCE = 3
+local DISTANCE_BIAS_POWER = 1.8
 local DISTANCE_CHANGE_INTERVAL = 1
 local MIN_DISTANCE_DELTA = 0.15
-local INNER_GUARD_DISTANCE = 2.04
-local OUTER_GUARD_DISTANCE = 3.46
+local INNER_GUARD_DISTANCE = 1.03
+local OUTER_GUARD_DISTANCE = 2.96
 local MICRO_OFFSET_BASE = 0.008
 local MICRO_OFFSET_VARIATION = 0.003
 local MICRO_MOVE_MIN = 0.01
 local MICRO_MOVE_MAX = 0.26
+local INNER_RECOVERY_TRIGGER_DISTANCE = 1.2
+local INNER_RECOVERY_TARGET_MIN = 2.05
+local INNER_RECOVERY_TARGET_MAX = 2.2
+local INNER_RECOVERY_MOVE_MIN = 0.14
+local INNER_RECOVERY_MOVE_MAX = 0.28
+local MANUAL_MOVE_WEIGHT = 0.1
+local MANUAL_OUTER_GUARD_DISTANCE = 2.85
 
 local TRACK_HORIZONTAL_OFFSET_DEGREES = 35
-local CAMERA_HORIZONTAL_FREE_DEGREES = 6
 local CAMERA_HORIZONTAL_LIMIT_DEGREES = 8
+local CAMERA_TOUCH_SENSITIVITY = 0.06
+local CAMERA_TOUCH_REGION_START = 0.34
+local CAMERA_MANUAL_SMOOTH_SPEED = 14
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
 local CHARACTER_TURN_SMOOTH_SPEED = 10
 local TARGET_UPDATE_INTERVAL = 0.12
@@ -106,7 +115,12 @@ local state = {
 	microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1,
 	microPhase = RandomGenerator:NextNumber(0, math.pi * 2),
 	microFrequency = RandomGenerator:NextNumber(0.72, 1.08),
-	cameraUserOffsetDegrees = 0,
+	innerRecoveryActive = false,
+	innerRecoveryTarget = INNER_RECOVERY_TARGET_MIN,
+	cameraRequestedOffsetDegrees = 0,
+	cameraAppliedOffsetDegrees = 0,
+	cameraTouchInput = nil,
+	cameraTouchLastPosition = nil,
 	controlledHumanoid = nil,
 	savedAutoRotate = nil,
 }
@@ -449,7 +463,9 @@ end
 local function releaseTrackingControl()
 	releaseMovement()
 	restoreCharacterFacing()
-	state.cameraUserOffsetDegrees = 0
+	state.innerRecoveryActive = false
+	state.cameraRequestedOffsetDegrees = 0
+	state.cameraAppliedOffsetDegrees = 0
 end
 
 local function randomizeStopDistance()
@@ -481,7 +497,11 @@ local function updateTarget()
 		return
 	end
 
-	state.target = getNearestBot()
+	local nextTarget = getNearestBot()
+	if nextTarget ~= state.target then
+		state.innerRecoveryActive = false
+	end
+	state.target = nextTarget
 end
 
 local function getSmoothAlpha(speed, deltaTime)
@@ -495,32 +515,6 @@ local function rotateHorizontalLeft(direction, degrees)
 	):VectorToWorldSpace(direction)
 end
 
-local function normalizeDegrees(degrees)
-	return ((degrees + 180) % 360) - 180
-end
-
-local function getSignedHorizontalAngle(fromDirection, toDirection)
-	local dot = math.clamp(fromDirection:Dot(toDirection), -1, 1)
-	local crossY = fromDirection:Cross(toDirection).Y
-	return math.deg(math.atan2(crossY, dot))
-end
-
-local function softlyLimitHorizontalOffset(offsetDegrees)
-	local absoluteOffset = math.abs(offsetDegrees)
-	if absoluteOffset <= CAMERA_HORIZONTAL_FREE_DEGREES then
-		return offsetDegrees
-	end
-
-	local edgeRange = CAMERA_HORIZONTAL_LIMIT_DEGREES
-		- CAMERA_HORIZONTAL_FREE_DEGREES
-	local edgeProgress = absoluteOffset - CAMERA_HORIZONTAL_FREE_DEGREES
-	local compressedEdge = edgeRange
-		* (1 - math.exp(-edgeProgress / edgeRange))
-	local limitedOffset = CAMERA_HORIZONTAL_FREE_DEGREES + compressedEdge
-	return math.sign(offsetDegrees)
-		* math.min(limitedOffset, CAMERA_HORIZONTAL_LIMIT_DEGREES)
-end
-
 local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 	local offset = targetRoot.Position - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
@@ -530,7 +524,7 @@ local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 
 	enableCharacterFacing(humanoid)
 	local cameraOffset = math.clamp(
-		state.cameraUserOffsetDegrees or 0,
+		state.cameraAppliedOffsetDegrees or 0,
 		-CAMERA_HORIZONTAL_LIMIT_DEGREES,
 		CAMERA_HORIZONTAL_LIMIT_DEGREES
 	)
@@ -559,17 +553,16 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 		return
 	end
 
-	local currentLook = camera.CFrame.LookVector
-	local horizontalLook = Vector3.new(currentLook.X, 0, currentLook.Z)
-	if horizontalLook.Magnitude <= 0.001 then
-		return
-	end
-
 	local towardTarget = horizontalOffset.Unit
-	local rawAngle = getSignedHorizontalAngle(towardTarget, horizontalLook.Unit)
-	local rawOffset = normalizeDegrees(rawAngle - TRACK_HORIZONTAL_OFFSET_DEGREES)
-	local limitedOffset = softlyLimitHorizontalOffset(rawOffset)
-	state.cameraUserOffsetDegrees = limitedOffset
+	local requestedOffset = math.clamp(
+		state.cameraRequestedOffsetDegrees or 0,
+		-CAMERA_HORIZONTAL_LIMIT_DEGREES,
+		CAMERA_HORIZONTAL_LIMIT_DEGREES
+	)
+	local currentOffset = state.cameraAppliedOffsetDegrees or 0
+	local alpha = getSmoothAlpha(CAMERA_MANUAL_SMOOTH_SPEED, deltaTime)
+	local limitedOffset = currentOffset + ((requestedOffset - currentOffset) * alpha)
+	state.cameraAppliedOffsetDegrees = limitedOffset
 
 	local limitedForward = rotateHorizontalLeft(
 		towardTarget,
@@ -577,8 +570,7 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	)
 
 	-- Usa a distancia, o zoom e a inclinacao vertical produzidos pela camera
-	-- normal. A horizontal pode mexer livremente perto dos 35 graus e encontra
-	-- resistencia suave antes do limite absoluto de 8 graus para cada lado.
+	-- normal. O arraste horizontal mobile controla um pequeno desvio dos 35 graus.
 	local focus = camera.Focus.Position
 	local cameraOffset = camera.CFrame.Position - focus
 	local verticalOffset = cameraOffset.Y
@@ -591,6 +583,51 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 		- (limitedForward * horizontalRadius)
 		+ Vector3.new(0, verticalOffset, 0)
 	camera.CFrame = CFrame.lookAt(cameraPosition, focus, Vector3.new(0, 1, 0))
+end
+
+local function addManualMovementInfluence(
+	movementVector,
+	manualDirection,
+	distance,
+	fromTarget,
+	isRecovering
+)
+	local horizontalManual = Vector3.new(
+		manualDirection.X,
+		0,
+		manualDirection.Z
+	)
+	local manualMagnitude = math.min(horizontalManual.Magnitude, 1)
+	if manualMagnitude <= 0.001 then
+		return movementVector
+	end
+
+	-- Durante o recuo nao deixa o joystick empurrar de volta para dentro.
+	local radialAmount = horizontalManual:Dot(fromTarget)
+	if (isRecovering or distance <= MIN_STOP_DISTANCE) and radialAmount < 0 then
+		horizontalManual = horizontalManual - (fromTarget * radialAmount)
+	end
+
+	-- Perto do limite externo ainda permite movimento lateral, mas nao afastar.
+	radialAmount = horizontalManual:Dot(fromTarget)
+	if distance >= MANUAL_OUTER_GUARD_DISTANCE and radialAmount > 0 then
+		horizontalManual = horizontalManual - (fromTarget * radialAmount)
+	end
+
+	if horizontalManual.Magnitude <= 0.001 then
+		return movementVector
+	end
+
+	local filteredMagnitude = math.min(horizontalManual.Magnitude, 1)
+	local manualInfluence = horizontalManual.Unit
+		* filteredMagnitude
+		* MANUAL_MOVE_WEIGHT
+	local combinedMovement = movementVector + manualInfluence
+	if combinedMovement.Magnitude > 1 then
+		return combinedMovement.Unit
+	end
+
+	return combinedMovement
 end
 
 local function movementStep(deltaTime)
@@ -613,6 +650,7 @@ local function movementStep(deltaTime)
 	local offset = targetRoot.Position - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
 	local distance = horizontalOffset.Magnitude
+	local manualMoveDirection = humanoid.MoveDirection
 
 	state.movementLocked = true
 	if distance <= 0.001 then
@@ -635,11 +673,36 @@ local function movementStep(deltaTime)
 		+ (math.sin((now * state.microFrequency) + state.microPhase) * MICRO_OFFSET_VARIATION)
 
 	local movementVector = nil
-	if distance > MAX_STOP_DISTANCE then
+	if not state.innerRecoveryActive
+		and distance <= INNER_RECOVERY_TRIGGER_DISTANCE then
+		state.innerRecoveryActive = true
+		state.innerRecoveryTarget = RandomGenerator:NextNumber(
+			INNER_RECOVERY_TARGET_MIN,
+			INNER_RECOVERY_TARGET_MAX
+		)
+	end
+
+	if state.innerRecoveryActive then
+		if distance >= state.innerRecoveryTarget then
+			state.innerRecoveryActive = false
+			state.stopDistance = getBiasedTrackDistance()
+			movementVector = (tangent * MICRO_MOVE_MIN)
+				+ (fromTarget * (MICRO_MOVE_MIN * 0.25))
+		else
+			local remainingDistance = state.innerRecoveryTarget - distance
+			local recoveryStrength = math.clamp(
+				INNER_RECOVERY_MOVE_MIN + (remainingDistance * 0.11),
+				INNER_RECOVERY_MOVE_MIN,
+				INNER_RECOVERY_MOVE_MAX
+			)
+			local recoveryDirection = fromTarget + (tangent * microOffset)
+			movementVector = recoveryDirection.Unit * recoveryStrength
+		end
+	elseif distance > MAX_STOP_DISTANCE then
 		movementVector = towardTarget
 	elseif distance < MIN_STOP_DISTANCE then
-		local correction = (fromTarget * 0.78) + (tangent * 0.22)
-		movementVector = correction.Unit * 0.5
+		local correction = fromTarget + (tangent * microOffset)
+		movementVector = correction.Unit * INNER_RECOVERY_MOVE_MAX
 	else
 		local desiredDistance = math.clamp(
 			state.stopDistance,
@@ -664,6 +727,13 @@ local function movementStep(deltaTime)
 		end
 	end
 
+	movementVector = addManualMovementInfluence(
+		movementVector,
+		manualMoveDirection,
+		distance,
+		fromTarget,
+		state.innerRecoveryActive
+	)
 	humanoid:Move(movementVector, false)
 end
 
@@ -687,7 +757,9 @@ local function toggleTrack()
 		state.microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1
 		state.microPhase = RandomGenerator:NextNumber(0, math.pi * 2)
 		state.microFrequency = RandomGenerator:NextNumber(0.72, 1.08)
-		state.cameraUserOffsetDegrees = 0
+		state.innerRecoveryActive = false
+		state.cameraRequestedOffsetDegrees = 0
+		state.cameraAppliedOffsetDegrees = 0
 		state.hasBomb = playerHasBomb()
 		refreshCandidateCache()
 		updateTarget()
@@ -802,6 +874,58 @@ connect(UserInputService.InputEnded, function(input)
 	end
 end)
 
+local function isPointInsideTrackButton(position)
+	local buttonPosition = MobileButton.AbsolutePosition
+	local buttonSize = MobileButton.AbsoluteSize
+	return position.X >= buttonPosition.X
+		and position.X <= buttonPosition.X + buttonSize.X
+		and position.Y >= buttonPosition.Y
+		and position.Y <= buttonPosition.Y + buttonSize.Y
+end
+
+-- Le diretamente o arraste mobile para que a camera horizontal responda mesmo
+-- depois que o CFrame e limitado perto do angulo de 35 graus.
+connect(UserInputService.TouchStarted, function(input, gameProcessedEvent)
+	if gameProcessedEvent or not state.enabled or isPointInsideTrackButton(input.Position) then
+		return
+	end
+
+	local camera = workspace.CurrentCamera
+	if not camera
+		or input.Position.X < (camera.ViewportSize.X * CAMERA_TOUCH_REGION_START)
+		or state.cameraTouchInput then
+		return
+	end
+
+	state.cameraTouchInput = input
+	state.cameraTouchLastPosition = input.Position
+end)
+
+connect(UserInputService.TouchMoved, function(input)
+	if input ~= state.cameraTouchInput or not state.cameraTouchLastPosition then
+		return
+	end
+
+	local delta = input.Position - state.cameraTouchLastPosition
+	state.cameraTouchLastPosition = input.Position
+	if not state.enabled or not state.hasBomb or not state.target then
+		return
+	end
+
+	state.cameraRequestedOffsetDegrees = math.clamp(
+		state.cameraRequestedOffsetDegrees - (delta.X * CAMERA_TOUCH_SENSITIVITY),
+		-CAMERA_HORIZONTAL_LIMIT_DEGREES,
+		CAMERA_HORIZONTAL_LIMIT_DEGREES
+	)
+end)
+
+connect(UserInputService.TouchEnded, function(input)
+	if input == state.cameraTouchInput then
+		state.cameraTouchInput = nil
+		state.cameraTouchLastPosition = nil
+	end
+end)
+
 connect(workspace.DescendantAdded, function(descendant)
 	if descendant:IsA("Model")
 		or descendant:IsA("Humanoid")
@@ -907,4 +1031,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[AutoTrack] Carregado: 2.0 a 3.5 studs e camera limitada perto de 35 graus.")
+warn("[AutoTrack] Carregado: 1.0 a 3.0 studs, recuo humano e camera mobile ajustavel.")
