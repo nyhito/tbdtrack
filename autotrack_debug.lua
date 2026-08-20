@@ -1,6 +1,6 @@
 -- AutoTrack Mobile
 -- Segue o bot mais proximo somente enquanto a bomba estiver com o jogador.
--- Mantem movimento continuo na faixa e alinha boneco/camera 35 graus a esquerda.
+-- Mantem movimento continuo e camera/boneco proximos de 35 graus a esquerda.
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -17,18 +17,20 @@ local SCREEN_GUI_NAME = "AutoTrackBotDebugMobile"
 local MOVE_BIND_NAME = "NT_AutoTrackMovement_" .. tostring(LocalPlayer.UserId)
 
 local MIN_STOP_DISTANCE = 2
-local MAX_STOP_DISTANCE = 2.8
+local MAX_STOP_DISTANCE = 3.5
+local DISTANCE_BIAS_POWER = 0.38
 local DISTANCE_CHANGE_INTERVAL = 1
-local MIN_DISTANCE_DELTA = 0.12
-local INNER_GUARD_DISTANCE = 2.06
-local OUTER_GUARD_DISTANCE = 2.74
-local MICRO_OFFSET_BASE = 0.16
-local MICRO_OFFSET_VARIATION = 0.055
-local MICRO_MOVE_MIN = 0.12
-local MICRO_MOVE_MAX = 0.32
+local MIN_DISTANCE_DELTA = 0.15
+local INNER_GUARD_DISTANCE = 2.04
+local OUTER_GUARD_DISTANCE = 3.46
+local MICRO_OFFSET_BASE = 0.008
+local MICRO_OFFSET_VARIATION = 0.003
+local MICRO_MOVE_MIN = 0.01
+local MICRO_MOVE_MAX = 0.26
 
 local TRACK_HORIZONTAL_OFFSET_DEGREES = 35
-local CAMERA_HORIZONTAL_SMOOTH_SPEED = 7.5
+local CAMERA_HORIZONTAL_FREE_DEGREES = 6
+local CAMERA_HORIZONTAL_LIMIT_DEGREES = 8
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
 local CHARACTER_TURN_SMOOTH_SPEED = 10
 local TARGET_UPDATE_INTERVAL = 0.12
@@ -36,6 +38,13 @@ local BOMB_CHECK_INTERVAL = 0.08
 local CACHE_REFRESH_INTERVAL = 1
 local DRAG_HOLD_TIME = 0.5
 local RandomGenerator = Random.new()
+
+local function getBiasedTrackDistance()
+	local sample = RandomGenerator:NextNumber(0, 1)
+	local biasedSample = sample ^ DISTANCE_BIAS_POWER
+	return MIN_STOP_DISTANCE
+		+ ((MAX_STOP_DISTANCE - MIN_STOP_DISTANCE) * biasedSample)
+end
 
 local BOMB_NAME_HINTS = {
 	"bomb",
@@ -92,12 +101,12 @@ local state = {
 	connections = {},
 	candidates = {},
 	target = nil,
-	stopDistance = RandomGenerator:NextNumber(MIN_STOP_DISTANCE, MAX_STOP_DISTANCE),
+	stopDistance = getBiasedTrackDistance(),
 	distanceElapsed = 0,
 	microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1,
 	microPhase = RandomGenerator:NextNumber(0, math.pi * 2),
 	microFrequency = RandomGenerator:NextNumber(0.72, 1.08),
-	cameraHorizontalForward = nil,
+	cameraUserOffsetDegrees = 0,
 	controlledHumanoid = nil,
 	savedAutoRotate = nil,
 }
@@ -440,18 +449,18 @@ end
 local function releaseTrackingControl()
 	releaseMovement()
 	restoreCharacterFacing()
-	state.cameraHorizontalForward = nil
+	state.cameraUserOffsetDegrees = 0
 end
 
 local function randomizeStopDistance()
 	local previousDistance = state.stopDistance
-	local nextDistance = RandomGenerator:NextNumber(MIN_STOP_DISTANCE, MAX_STOP_DISTANCE)
+	local nextDistance = getBiasedTrackDistance()
 
-	for _ = 1, 6 do
+	for _ = 1, 8 do
 		if not previousDistance or math.abs(nextDistance - previousDistance) >= MIN_DISTANCE_DELTA then
 			break
 		end
-		nextDistance = RandomGenerator:NextNumber(MIN_STOP_DISTANCE, MAX_STOP_DISTANCE)
+		nextDistance = getBiasedTrackDistance()
 	end
 
 	if previousDistance and math.abs(nextDistance - previousDistance) < MIN_DISTANCE_DELTA then
@@ -486,6 +495,32 @@ local function rotateHorizontalLeft(direction, degrees)
 	):VectorToWorldSpace(direction)
 end
 
+local function normalizeDegrees(degrees)
+	return ((degrees + 180) % 360) - 180
+end
+
+local function getSignedHorizontalAngle(fromDirection, toDirection)
+	local dot = math.clamp(fromDirection:Dot(toDirection), -1, 1)
+	local crossY = fromDirection:Cross(toDirection).Y
+	return math.deg(math.atan2(crossY, dot))
+end
+
+local function softlyLimitHorizontalOffset(offsetDegrees)
+	local absoluteOffset = math.abs(offsetDegrees)
+	if absoluteOffset <= CAMERA_HORIZONTAL_FREE_DEGREES then
+		return offsetDegrees
+	end
+
+	local edgeRange = CAMERA_HORIZONTAL_LIMIT_DEGREES
+		- CAMERA_HORIZONTAL_FREE_DEGREES
+	local edgeProgress = absoluteOffset - CAMERA_HORIZONTAL_FREE_DEGREES
+	local compressedEdge = edgeRange
+		* (1 - math.exp(-edgeProgress / edgeRange))
+	local limitedOffset = CAMERA_HORIZONTAL_FREE_DEGREES + compressedEdge
+	return math.sign(offsetDegrees)
+		* math.min(limitedOffset, CAMERA_HORIZONTAL_LIMIT_DEGREES)
+end
+
 local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 	local offset = targetRoot.Position - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
@@ -494,9 +529,14 @@ local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 	end
 
 	enableCharacterFacing(humanoid)
+	local cameraOffset = math.clamp(
+		state.cameraUserOffsetDegrees or 0,
+		-CAMERA_HORIZONTAL_LIMIT_DEGREES,
+		CAMERA_HORIZONTAL_LIMIT_DEGREES
+	)
 	local angledForward = rotateHorizontalLeft(
 		horizontalOffset.Unit,
-		TRACK_HORIZONTAL_OFFSET_DEGREES
+		TRACK_HORIZONTAL_OFFSET_DEGREES + cameraOffset
 	)
 	local desiredFacing = CFrame.lookAt(
 		localRoot.Position,
@@ -519,29 +559,26 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 		return
 	end
 
-	local desiredForward = rotateHorizontalLeft(
-		horizontalOffset.Unit,
-		TRACK_HORIZONTAL_OFFSET_DEGREES
-	)
-	local currentForward = state.cameraHorizontalForward
-	if not currentForward or currentForward.Magnitude <= 0.001 then
-		local currentLook = camera.CFrame.LookVector
-		local horizontalLook = Vector3.new(currentLook.X, 0, currentLook.Z)
-		currentForward = horizontalLook.Magnitude > 0.001
-			and horizontalLook.Unit
-			or desiredForward
+	local currentLook = camera.CFrame.LookVector
+	local horizontalLook = Vector3.new(currentLook.X, 0, currentLook.Z)
+	if horizontalLook.Magnitude <= 0.001 then
+		return
 	end
 
-	local alpha = getSmoothAlpha(CAMERA_HORIZONTAL_SMOOTH_SPEED, deltaTime)
-	local blendedForward = currentForward:Lerp(desiredForward, alpha)
-	if blendedForward.Magnitude <= 0.001 then
-		blendedForward = desiredForward
-	end
-	blendedForward = blendedForward.Unit
-	state.cameraHorizontalForward = blendedForward
+	local towardTarget = horizontalOffset.Unit
+	local rawAngle = getSignedHorizontalAngle(towardTarget, horizontalLook.Unit)
+	local rawOffset = normalizeDegrees(rawAngle - TRACK_HORIZONTAL_OFFSET_DEGREES)
+	local limitedOffset = softlyLimitHorizontalOffset(rawOffset)
+	state.cameraUserOffsetDegrees = limitedOffset
+
+	local limitedForward = rotateHorizontalLeft(
+		towardTarget,
+		TRACK_HORIZONTAL_OFFSET_DEGREES + limitedOffset
+	)
 
 	-- Usa a distancia, o zoom e a inclinacao vertical produzidos pela camera
-	-- normal; somente o eixo horizontal fica alinhado em 35 graus.
+	-- normal. A horizontal pode mexer livremente perto dos 35 graus e encontra
+	-- resistencia suave antes do limite absoluto de 8 graus para cada lado.
 	local focus = camera.Focus.Position
 	local cameraOffset = camera.CFrame.Position - focus
 	local verticalOffset = cameraOffset.Y
@@ -551,7 +588,7 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	end
 
 	local cameraPosition = focus
-		- (blendedForward * horizontalRadius)
+		- (limitedForward * horizontalRadius)
 		+ Vector3.new(0, verticalOffset, 0)
 	camera.CFrame = CFrame.lookAt(cameraPosition, focus, Vector3.new(0, 1, 0))
 end
@@ -587,8 +624,8 @@ local function movementStep(deltaTime)
 		return
 	end
 
-	updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 	updateTrackingCamera(localRoot, targetRoot, deltaTime)
+	updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 
 	local towardTarget = horizontalOffset.Unit
 	local fromTarget = -towardTarget
@@ -650,7 +687,7 @@ local function toggleTrack()
 		state.microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1
 		state.microPhase = RandomGenerator:NextNumber(0, math.pi * 2)
 		state.microFrequency = RandomGenerator:NextNumber(0.72, 1.08)
-		state.cameraHorizontalForward = nil
+		state.cameraUserOffsetDegrees = 0
 		state.hasBomb = playerHasBomb()
 		refreshCandidateCache()
 		updateTarget()
@@ -870,4 +907,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[AutoTrack] Carregado: movimento continuo e alinhamento horizontal de 35 graus.")
+warn("[AutoTrack] Carregado: 2.0 a 3.5 studs e camera limitada perto de 35 graus.")
