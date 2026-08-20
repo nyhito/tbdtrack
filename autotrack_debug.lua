@@ -1,6 +1,6 @@
 -- AutoTrack Mobile
 -- Segue o bot mais proximo somente enquanto a bomba estiver com o jogador.
--- Mantem movimento continuo na faixa e acompanha o alvo com camera suave.
+-- Mantem movimento continuo na faixa e alinha boneco/camera 35 graus a esquerda.
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -27,13 +27,9 @@ local MICRO_OFFSET_VARIATION = 0.055
 local MICRO_MOVE_MIN = 0.12
 local MICRO_MOVE_MAX = 0.32
 
-local CAMERA_HEIGHT = 25
-local CAMERA_BACK_DISTANCE = 9.5
-local CAMERA_FOCUS_BLEND = 0.38
-local CAMERA_FOCUS_HEIGHT = 0.9
-local CAMERA_YAW_OFFSET_DEGREES = 43
-local CAMERA_YAW_VARIATION_DEGREES = 2.4
-local CAMERA_SMOOTH_SPEED = 4.8
+local TRACK_HORIZONTAL_OFFSET_DEGREES = 35
+local CAMERA_HORIZONTAL_SMOOTH_SPEED = 7.5
+local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
 local CHARACTER_TURN_SMOOTH_SPEED = 10
 local TARGET_UPDATE_INTERVAL = 0.12
 local BOMB_CHECK_INTERVAL = 0.08
@@ -101,13 +97,7 @@ local state = {
 	microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1,
 	microPhase = RandomGenerator:NextNumber(0, math.pi * 2),
 	microFrequency = RandomGenerator:NextNumber(0.72, 1.08),
-	cameraYawPhase = RandomGenerator:NextNumber(0, math.pi * 2),
-	cameraHeightPhase = RandomGenerator:NextNumber(0, math.pi * 2),
-	cameraBackPhase = RandomGenerator:NextNumber(0, math.pi * 2),
-	cameraActive = false,
-	controlledCamera = nil,
-	savedCameraType = nil,
-	savedCameraSubject = nil,
+	cameraHorizontalForward = nil,
 	controlledHumanoid = nil,
 	savedAutoRotate = nil,
 }
@@ -435,45 +425,6 @@ local function enableCharacterFacing(humanoid)
 	humanoid.AutoRotate = false
 end
 
-local function restoreCamera()
-	if not state.cameraActive then
-		return
-	end
-
-	local camera = state.controlledCamera
-	if camera then
-		pcall(function()
-			camera.CameraType = state.savedCameraType or Enum.CameraType.Custom
-			local subject = state.savedCameraSubject
-			if subject and subject.Parent then
-				camera.CameraSubject = subject
-			else
-				local humanoid = getLocalMover()
-				if humanoid then
-					camera.CameraSubject = humanoid
-				end
-			end
-		end)
-	end
-
-	state.cameraActive = false
-	state.controlledCamera = nil
-	state.savedCameraType = nil
-	state.savedCameraSubject = nil
-end
-
-local function enableCamera(camera)
-	if state.controlledCamera ~= camera then
-		restoreCamera()
-		state.controlledCamera = camera
-		state.savedCameraType = camera.CameraType
-		state.savedCameraSubject = camera.CameraSubject
-		state.cameraActive = true
-	end
-
-	camera.CameraType = Enum.CameraType.Scriptable
-end
-
 local function releaseMovement()
 	if not state.movementLocked then
 		return
@@ -489,7 +440,7 @@ end
 local function releaseTrackingControl()
 	releaseMovement()
 	restoreCharacterFacing()
-	restoreCamera()
+	state.cameraHorizontalForward = nil
 end
 
 local function randomizeStopDistance()
@@ -528,6 +479,13 @@ local function getSmoothAlpha(speed, deltaTime)
 	return 1 - math.exp(-speed * math.max(deltaTime or 0, 0))
 end
 
+local function rotateHorizontalLeft(direction, degrees)
+	return CFrame.fromAxisAngle(
+		Vector3.new(0, 1, 0),
+		math.rad(degrees)
+	):VectorToWorldSpace(direction)
+end
+
 local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 	local offset = targetRoot.Position - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
@@ -536,9 +494,13 @@ local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 	end
 
 	enableCharacterFacing(humanoid)
+	local angledForward = rotateHorizontalLeft(
+		horizontalOffset.Unit,
+		TRACK_HORIZONTAL_OFFSET_DEGREES
+	)
 	local desiredFacing = CFrame.lookAt(
 		localRoot.Position,
-		localRoot.Position + horizontalOffset.Unit,
+		localRoot.Position + angledForward,
 		Vector3.new(0, 1, 0)
 	)
 	local alpha = getSmoothAlpha(CHARACTER_TURN_SMOOTH_SPEED, deltaTime)
@@ -557,23 +519,41 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 		return
 	end
 
-	enableCamera(camera)
+	local desiredForward = rotateHorizontalLeft(
+		horizontalOffset.Unit,
+		TRACK_HORIZONTAL_OFFSET_DEGREES
+	)
+	local currentForward = state.cameraHorizontalForward
+	if not currentForward or currentForward.Magnitude <= 0.001 then
+		local currentLook = camera.CFrame.LookVector
+		local horizontalLook = Vector3.new(currentLook.X, 0, currentLook.Z)
+		currentForward = horizontalLook.Magnitude > 0.001
+			and horizontalLook.Unit
+			or desiredForward
+	end
 
-	local now = os.clock()
-	local towardTarget = horizontalOffset.Unit
-	local yawVariation = math.sin((now * 0.52) + state.cameraYawPhase) * CAMERA_YAW_VARIATION_DEGREES
-	local yaw = math.rad(CAMERA_YAW_OFFSET_DEGREES + yawVariation)
-	local cameraForward = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), yaw):VectorToWorldSpace(towardTarget)
+	local alpha = getSmoothAlpha(CAMERA_HORIZONTAL_SMOOTH_SPEED, deltaTime)
+	local blendedForward = currentForward:Lerp(desiredForward, alpha)
+	if blendedForward.Magnitude <= 0.001 then
+		blendedForward = desiredForward
+	end
+	blendedForward = blendedForward.Unit
+	state.cameraHorizontalForward = blendedForward
 
-	local height = CAMERA_HEIGHT + (math.sin((now * 0.37) + state.cameraHeightPhase) * 0.45)
-	local backDistance = CAMERA_BACK_DISTANCE + (math.sin((now * 0.29) + state.cameraBackPhase) * 0.35)
-	local focus = localRoot.Position:Lerp(targetRoot.Position, CAMERA_FOCUS_BLEND)
-		+ Vector3.new(0, CAMERA_FOCUS_HEIGHT, 0)
-	local cameraPosition = focus - (cameraForward * backDistance) + Vector3.new(0, height, 0)
-	local desiredCFrame = CFrame.lookAt(cameraPosition, focus, Vector3.new(0, 1, 0))
-	local alpha = getSmoothAlpha(CAMERA_SMOOTH_SPEED, deltaTime)
+	-- Usa a distancia, o zoom e a inclinacao vertical produzidos pela camera
+	-- normal; somente o eixo horizontal fica alinhado em 35 graus.
+	local focus = camera.Focus.Position
+	local cameraOffset = camera.CFrame.Position - focus
+	local verticalOffset = cameraOffset.Y
+	local horizontalRadius = Vector3.new(cameraOffset.X, 0, cameraOffset.Z).Magnitude
+	if horizontalRadius <= CAMERA_MIN_HORIZONTAL_RADIUS then
+		return
+	end
 
-	camera.CFrame = camera.CFrame:Lerp(desiredCFrame, alpha)
+	local cameraPosition = focus
+		- (blendedForward * horizontalRadius)
+		+ Vector3.new(0, verticalOffset, 0)
+	camera.CFrame = CFrame.lookAt(cameraPosition, focus, Vector3.new(0, 1, 0))
 end
 
 local function movementStep(deltaTime)
@@ -670,9 +650,7 @@ local function toggleTrack()
 		state.microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1
 		state.microPhase = RandomGenerator:NextNumber(0, math.pi * 2)
 		state.microFrequency = RandomGenerator:NextNumber(0.72, 1.08)
-		state.cameraYawPhase = RandomGenerator:NextNumber(0, math.pi * 2)
-		state.cameraHeightPhase = RandomGenerator:NextNumber(0, math.pi * 2)
-		state.cameraBackPhase = RandomGenerator:NextNumber(0, math.pi * 2)
+		state.cameraHorizontalForward = nil
 		state.hasBomb = playerHasBomb()
 		refreshCandidateCache()
 		updateTarget()
@@ -892,4 +870,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[AutoTrack] Carregado: movimento continuo de 2.0 a 2.8 studs com camera diagonal suave.")
+warn("[AutoTrack] Carregado: movimento continuo e alinhamento horizontal de 35 graus.")
