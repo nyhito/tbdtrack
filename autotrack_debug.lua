@@ -59,9 +59,9 @@ local CAMERA_TOUCH_REGION_START = 0.3
 local CAMERA_MANUAL_SMOOTH_SPEED = 14
 local CAMERA_BASE_ERROR_LIMIT_DEGREES = 5
 local CAMERA_BASE_MIN_ABSOLUTE_DEGREES = 0.35
-local CAMERA_BASE_CHANGE_MIN = 0.22
-local CAMERA_BASE_CHANGE_MAX = 0.58
-local CAMERA_BASE_SMOOTH_SPEED = 8.5
+local CAMERA_BASE_CHANGE_MIN = 0.38
+local CAMERA_BASE_CHANGE_MAX = 0.78
+local CAMERA_BASE_SMOOTH_SPEED = 5.4
 local CAMERA_MICRO_PRIMARY_DEGREES = 0.14
 local CAMERA_MICRO_SECONDARY_DEGREES = 0.06
 local CAMERA_MICRO_PRIMARY_SPEED = 2.1
@@ -72,12 +72,25 @@ local CAMERA_FLICK_LIGHT_MIN = 0.5
 local CAMERA_FLICK_LIGHT_MAX = 1.4
 local CAMERA_FLICK_TURN_MIN = 2.2
 local CAMERA_FLICK_TURN_MAX = 4.6
-local CAMERA_FLICK_DURATION_MIN = 0.08
-local CAMERA_FLICK_DURATION_MAX = 0.15
+local CAMERA_FLICK_DURATION_MIN = 0.16
+local CAMERA_FLICK_DURATION_MAX = 0.28
 local CAMERA_FLICK_TURN_THRESHOLD_DEGREES = 26
 local CAMERA_FLICK_SAMPLE_DISTANCE = 0.08
 local CAMERA_FLICK_COOLDOWN = 0.18
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
+local CAMERA_ENGAGE_DURATION_MIN = 0.18
+local CAMERA_ENGAGE_DURATION_MAX = 0.28
+
+local SHARP_TURN_THRESHOLD_DEGREES = 52
+local SHARP_TURN_DISTANCE_MIN = 2
+local SHARP_TURN_DISTANCE_MAX = 3
+local SHARP_TURN_SETTLE_TOLERANCE = 0.18
+local SHARP_TURN_SETTLE_TIME = 0.06
+local SHARP_TURN_HOLD_MIN = 0.16
+local SHARP_TURN_HOLD_MAX = 0.24
+local SHARP_TURN_MAX_DURATION_MIN = 0.58
+local SHARP_TURN_MAX_DURATION_MAX = 0.78
+local SHARP_TURN_COOLDOWN = 0.42
 local CHARACTER_TURN_SMOOTH_SPEED = 10
 local TARGET_UPDATE_INTERVAL = 0.12
 local BOMB_CHECK_INTERVAL = 0.08
@@ -183,8 +196,20 @@ local state = {
 	cameraFlickCooldown = 0,
 	cameraLastBotSamplePosition = nil,
 	cameraLastBotMoveDirection = nil,
+	cameraEngageActive = false,
+	cameraEngageElapsed = 0,
+	cameraEngageDuration = CAMERA_ENGAGE_DURATION_MIN,
+	cameraEngageStartCFrame = nil,
+	trackingActiveLastFrame = false,
 	cameraTouchInput = nil,
 	cameraTouchLastPosition = nil,
+	sharpTurnSpacingActive = false,
+	sharpTurnSpacingTarget = 2.5,
+	sharpTurnSpacingElapsed = 0,
+	sharpTurnSpacingHold = SHARP_TURN_HOLD_MIN,
+	sharpTurnSpacingMaxDuration = SHARP_TURN_MAX_DURATION_MIN,
+	sharpTurnSpacingSettled = 0,
+	sharpTurnSpacingCooldown = 0,
 	controlledHumanoid = nil,
 	savedAutoRotate = nil,
 }
@@ -202,6 +227,11 @@ ScreenGui.Name = SCREEN_GUI_NAME
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 1000
+ScreenGui.IgnoreGuiInset = true
+pcall(function()
+	ScreenGui.ScreenInsets = Enum.ScreenInsets.None
+	ScreenGui.ClipToDeviceSafeArea = false
+end)
 ScreenGui.Parent = PlayerGui
 
 local MobileButton = Instance.new("TextButton")
@@ -529,6 +559,9 @@ local function releaseTrackingControl()
 	releaseMovement()
 	restoreCharacterFacing()
 	state.innerRecoveryActive = false
+	state.sharpTurnSpacingActive = false
+	state.sharpTurnSpacingElapsed = 0
+	state.sharpTurnSpacingSettled = 0
 	state.aimElapsed = state.aimChangeInterval
 	state.cameraRequestedOffsetDegrees = 0
 	state.cameraAppliedOffsetDegrees = 0
@@ -536,6 +569,10 @@ local function releaseTrackingControl()
 	state.cameraFlickElapsed = state.cameraFlickDuration
 	state.cameraLastBotSamplePosition = nil
 	state.cameraLastBotMoveDirection = nil
+	state.cameraEngageActive = false
+	state.cameraEngageElapsed = 0
+	state.cameraEngageStartCFrame = nil
+	state.trackingActiveLastFrame = false
 end
 
 local function randomizeStopDistance()
@@ -570,15 +607,24 @@ local function updateTarget()
 	local nextTarget = getNearestBot()
 	if nextTarget ~= state.target then
 		state.innerRecoveryActive = false
+		state.sharpTurnSpacingActive = false
+		state.sharpTurnSpacingElapsed = 0
+		state.sharpTurnSpacingSettled = 0
 		state.aimElapsed = state.aimChangeInterval
 		state.cameraLastBotSamplePosition = nil
 		state.cameraLastBotMoveDirection = nil
+		state.trackingActiveLastFrame = false
 	end
 	state.target = nextTarget
 end
 
 local function getSmoothAlpha(speed, deltaTime)
 	return 1 - math.exp(-speed * math.max(deltaTime or 0, 0))
+end
+
+local function getSmoothStep(progress)
+	local clamped = math.clamp(progress, 0, 1)
+	return clamped * clamped * (3 - (2 * clamped))
 end
 
 local function rotateHorizontalLeft(direction, degrees)
@@ -729,6 +775,30 @@ local function startCameraFlick(minimumAmplitude, maximumAmplitude)
 	state.cameraFlickCooldown = CAMERA_FLICK_COOLDOWN
 end
 
+local function startSharpTurnSpacing()
+	if state.sharpTurnSpacingCooldown > 0 then
+		return
+	end
+
+	state.sharpTurnSpacingActive = true
+	state.sharpTurnSpacingTarget = RandomGenerator:NextNumber(
+		SHARP_TURN_DISTANCE_MIN,
+		SHARP_TURN_DISTANCE_MAX
+	)
+	state.sharpTurnSpacingElapsed = 0
+	state.sharpTurnSpacingSettled = 0
+	state.sharpTurnSpacingHold = RandomGenerator:NextNumber(
+		SHARP_TURN_HOLD_MIN,
+		SHARP_TURN_HOLD_MAX
+	)
+	state.sharpTurnSpacingMaxDuration = RandomGenerator:NextNumber(
+		SHARP_TURN_MAX_DURATION_MIN,
+		SHARP_TURN_MAX_DURATION_MAX
+	)
+	state.sharpTurnSpacingCooldown = SHARP_TURN_COOLDOWN
+	state.innerRecoveryActive = false
+end
+
 local function updateCameraVariation(targetRoot, deltaTime)
 	state.cameraBaseElapsed = state.cameraBaseElapsed + deltaTime
 	if state.cameraBaseElapsed >= state.cameraBaseChangeInterval then
@@ -744,6 +814,10 @@ local function updateCameraVariation(targetRoot, deltaTime)
 		0,
 		state.cameraFlickCooldown - deltaTime
 	)
+	state.sharpTurnSpacingCooldown = math.max(
+		0,
+		state.sharpTurnSpacingCooldown - deltaTime
+	)
 	local targetPosition = targetRoot.Position
 	if not state.cameraLastBotSamplePosition then
 		state.cameraLastBotSamplePosition = targetPosition
@@ -756,19 +830,22 @@ local function updateCameraVariation(targetRoot, deltaTime)
 		)
 		if horizontalDisplacement.Magnitude >= CAMERA_FLICK_SAMPLE_DISTANCE then
 			local moveDirection = horizontalDisplacement.Unit
-			if state.cameraLastBotMoveDirection
-				and state.cameraFlickCooldown <= 0 then
+			if state.cameraLastBotMoveDirection then
 				local directionDot = math.clamp(
 					state.cameraLastBotMoveDirection:Dot(moveDirection),
 					-1,
 					1
 				)
 				local turnDegrees = math.deg(math.acos(directionDot))
-				if turnDegrees >= CAMERA_FLICK_TURN_THRESHOLD_DEGREES then
+				if turnDegrees >= CAMERA_FLICK_TURN_THRESHOLD_DEGREES
+					and state.cameraFlickCooldown <= 0 then
 					startCameraFlick(
 						CAMERA_FLICK_TURN_MIN,
 						CAMERA_FLICK_TURN_MAX
 					)
+				end
+				if turnDegrees >= SHARP_TURN_THRESHOLD_DEGREES then
+					startSharpTurnSpacing()
 				end
 			end
 			state.cameraLastBotMoveDirection = moveDirection
@@ -798,8 +875,9 @@ local function updateCameraVariation(targetRoot, deltaTime)
 			0,
 			1
 		)
+		local easedProgress = getSmoothStep(progress)
 		state.cameraFlickOffsetDegrees = state.cameraFlickAmplitude
-			* math.sin(math.pi * progress)
+			* math.sin(math.pi * easedProgress)
 	else
 		state.cameraFlickOffsetDegrees = 0
 	end
@@ -894,7 +972,30 @@ local function updateTrackingCamera(localRoot, targetRoot, aimPosition, deltaTim
 	local cameraPosition = focus
 		- (limitedForward * horizontalRadius)
 		+ Vector3.new(0, verticalOffset, 0)
-	camera.CFrame = CFrame.lookAt(cameraPosition, focus, Vector3.new(0, 1, 0))
+	local desiredCameraCFrame = CFrame.lookAt(
+		cameraPosition,
+		focus,
+		Vector3.new(0, 1, 0)
+	)
+
+	if state.cameraEngageActive then
+		if not state.cameraEngageStartCFrame then
+			state.cameraEngageStartCFrame = camera.CFrame
+		end
+		state.cameraEngageElapsed = state.cameraEngageElapsed + deltaTime
+		local progress = state.cameraEngageElapsed
+			/ math.max(state.cameraEngageDuration, 0.001)
+		camera.CFrame = state.cameraEngageStartCFrame:Lerp(
+			desiredCameraCFrame,
+			getSmoothStep(progress)
+		)
+		if progress >= 1 then
+			state.cameraEngageActive = false
+			state.cameraEngageStartCFrame = nil
+		end
+	else
+		camera.CFrame = desiredCameraCFrame
+	end
 end
 
 local function addManualMovementInfluence(
@@ -959,6 +1060,17 @@ local function movementStep(deltaTime)
 		return
 	end
 
+	if not state.trackingActiveLastFrame then
+		state.trackingActiveLastFrame = true
+		state.cameraEngageActive = true
+		state.cameraEngageElapsed = 0
+		state.cameraEngageStartCFrame = nil
+		state.cameraEngageDuration = RandomGenerator:NextNumber(
+			CAMERA_ENGAGE_DURATION_MIN,
+			CAMERA_ENGAGE_DURATION_MAX
+		)
+	end
+
 	local offset = targetRoot.Position - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
 	local distance = horizontalOffset.Magnitude
@@ -990,7 +1102,31 @@ local function movementStep(deltaTime)
 		+ (math.sin((now * state.microFrequency) + state.microPhase) * MICRO_OFFSET_VARIATION)
 
 	local movementVector = nil
-	if not state.innerRecoveryActive
+	if state.sharpTurnSpacingActive then
+		state.sharpTurnSpacingElapsed = state.sharpTurnSpacingElapsed + deltaTime
+		local spacingError = math.abs(
+			distance - state.sharpTurnSpacingTarget
+		)
+		if state.sharpTurnSpacingElapsed >= state.sharpTurnSpacingHold
+			and spacingError <= SHARP_TURN_SETTLE_TOLERANCE then
+			state.sharpTurnSpacingSettled = state.sharpTurnSpacingSettled
+				+ deltaTime
+		else
+			state.sharpTurnSpacingSettled = 0
+		end
+
+		if state.sharpTurnSpacingSettled >= SHARP_TURN_SETTLE_TIME
+			or state.sharpTurnSpacingElapsed
+				>= state.sharpTurnSpacingMaxDuration then
+			state.sharpTurnSpacingActive = false
+			state.sharpTurnSpacingElapsed = 0
+			state.sharpTurnSpacingSettled = 0
+			randomizeStopDistance()
+		end
+	end
+
+	if not state.sharpTurnSpacingActive
+		and not state.innerRecoveryActive
 		and distance <= INNER_RECOVERY_TRIGGER_DISTANCE then
 		state.innerRecoveryActive = true
 		state.innerRecoveryTarget = RandomGenerator:NextNumber(
@@ -1027,9 +1163,15 @@ local function movementStep(deltaTime)
 		movementVector = correction.Unit * INNER_RECOVERY_MOVE_MAX
 	else
 		local desiredDistance = math.clamp(
-			state.stopDistance,
-			INNER_GUARD_DISTANCE,
-			OUTER_GUARD_DISTANCE
+			state.sharpTurnSpacingActive
+				and state.sharpTurnSpacingTarget
+				or state.stopDistance,
+			state.sharpTurnSpacingActive
+				and SHARP_TURN_DISTANCE_MIN
+				or INNER_GUARD_DISTANCE,
+			state.sharpTurnSpacingActive
+				and SHARP_TURN_DISTANCE_MAX
+				or OUTER_GUARD_DISTANCE
 		)
 		local desiredFromCenter = (fromTarget * desiredDistance)
 			+ aimShift
@@ -1086,13 +1228,17 @@ local function toggleTrack()
 		state.microPhase = RandomGenerator:NextNumber(0, math.pi * 2)
 		state.microFrequency = RandomGenerator:NextNumber(0.72, 1.08)
 		state.innerRecoveryActive = false
+		state.sharpTurnSpacingActive = false
+		state.sharpTurnSpacingElapsed = 0
+		state.sharpTurnSpacingSettled = 0
+		state.sharpTurnSpacingCooldown = 0
 		state.aimReturnFromEdge = false
 		randomizeAimTarget()
 		state.aimAppliedOffset = state.aimTargetOffset
 		state.cameraRequestedOffsetDegrees = 0
 		state.cameraAppliedOffsetDegrees = 0
 		randomizeCameraBaseOffset()
-		state.cameraBaseAppliedOffsetDegrees = state.cameraBaseTargetOffsetDegrees
+		state.cameraBaseAppliedOffsetDegrees = 0
 		state.cameraFlickElapsed = state.cameraFlickDuration
 		state.cameraFlickOffsetDegrees = 0
 		state.cameraFlickRoutineElapsed = 0
@@ -1105,6 +1251,10 @@ local function toggleTrack()
 		state.cameraMicroPhaseB = RandomGenerator:NextNumber(0, math.pi * 2)
 		state.cameraLastBotSamplePosition = nil
 		state.cameraLastBotMoveDirection = nil
+		state.cameraEngageActive = false
+		state.cameraEngageElapsed = 0
+		state.cameraEngageStartCFrame = nil
+		state.trackingActiveLastFrame = false
 		state.cameraTouchInput = nil
 		state.cameraTouchLastPosition = nil
 		state.hasBomb = playerHasBomb()
@@ -1133,8 +1283,21 @@ local function clampButtonToScreen(position)
 	end
 
 	local viewport = camera.ViewportSize
-	local x = math.clamp(position.X.Offset, 4, math.max(4, viewport.X - MobileButton.AbsoluteSize.X - 4))
-	local y = math.clamp(position.Y.Offset, 4, math.max(4, viewport.Y - MobileButton.AbsoluteSize.Y - 4))
+	local screenSize = ScreenGui.AbsoluteSize
+	if screenSize.X > 0 and screenSize.Y > 0 then
+		viewport = screenSize
+	end
+
+	local x = math.clamp(
+		position.X.Offset,
+		0,
+		math.max(0, viewport.X - MobileButton.AbsoluteSize.X)
+	)
+	local y = math.clamp(
+		position.Y.Offset,
+		0,
+		math.max(0, viewport.Y - MobileButton.AbsoluteSize.Y)
+	)
 	return UDim2.new(0, x, 0, y)
 end
 
@@ -1396,4 +1559,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[AutoTrack] Carregado: recuo em 1.8, alvo lateral variavel e camera com flick.")
+warn("[AutoTrack] Carregado: entrada suave, flick humanizado e espaco em viradas bruscas.")
