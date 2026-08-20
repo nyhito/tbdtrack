@@ -19,13 +19,7 @@ local MOVE_BIND_NAME = "NT_AutoTrackMovement_" .. tostring(LocalPlayer.UserId)
 local MIN_STOP_DISTANCE = 2
 local MAX_STOP_DISTANCE = 2.8
 local DISTANCE_CHANGE_INTERVAL = 1
-local DISTANCE_TOLERANCE = 0.08
 local MIN_DISTANCE_DELTA = 0.12
-local TURN_REACTION_MIN = 0.4
-local TURN_REACTION_MAX = 0.6
-local SHARP_TURN_DOT = math.cos(math.rad(55))
-local MIN_BOT_TURN_SPEED = 2
-local MAX_CONTINUOUS_MOTION_GAP = 0.45
 local TARGET_UPDATE_INTERVAL = 0.12
 local BOMB_CHECK_INTERVAL = 0.08
 local CACHE_REFRESH_INTERVAL = 1
@@ -89,12 +83,6 @@ local state = {
 	target = nil,
 	stopDistance = RandomGenerator:NextNumber(MIN_STOP_DISTANCE, MAX_STOP_DISTANCE),
 	distanceElapsed = 0,
-	observedTarget = nil,
-	lastTargetPosition = nil,
-	lastBotMoveDirection = nil,
-	lastBotMotionTime = 0,
-	followDirection = nil,
-	turnReactionUntil = 0,
 }
 environment[GLOBAL_STATE_NAME] = state
 
@@ -433,71 +421,16 @@ local function randomizeStopDistance()
 	state.stopDistance = nextDistance
 end
 
-local function resetTurnTracking(target)
-	state.observedTarget = target
-	state.lastTargetPosition = nil
-	state.lastBotMoveDirection = nil
-	state.lastBotMotionTime = 0
-	state.followDirection = nil
-	state.turnReactionUntil = 0
-end
-
 local function updateTarget()
 	if not state.enabled then
-		if state.target then
-			state.target = nil
-			resetTurnTracking(nil)
-		end
+		state.target = nil
 		return
 	end
 
-	local newTarget = getNearestBot()
-	if newTarget ~= state.target then
-		state.target = newTarget
-		resetTurnTracking(newTarget)
-	end
+	state.target = getNearestBot()
 end
 
-local function observeSharpTurn(targetRoot, deltaTime)
-	if state.observedTarget ~= state.target then
-		resetTurnTracking(state.target)
-	end
-
-	local now = os.clock()
-	local position = targetRoot.Position
-	local horizontalPosition = Vector3.new(position.X, 0, position.Z)
-	local previousPosition = state.lastTargetPosition
-	state.lastTargetPosition = horizontalPosition
-
-	if previousPosition then
-		local displacement = horizontalPosition - previousPosition
-		local safeDeltaTime = math.max(deltaTime or 0, 1 / 240)
-		local speed = displacement.Magnitude / safeDeltaTime
-
-		if speed >= MIN_BOT_TURN_SPEED and displacement.Magnitude > 0 then
-			local newMoveDirection = displacement.Unit
-			local previousMoveDirection = state.lastBotMoveDirection
-			local motionGap = now - state.lastBotMotionTime
-
-			if previousMoveDirection and motionGap <= MAX_CONTINUOUS_MOTION_GAP then
-				local directionDot = math.clamp(previousMoveDirection:Dot(newMoveDirection), -1, 1)
-				if directionDot <= SHARP_TURN_DOT and now >= state.turnReactionUntil then
-					state.turnReactionUntil = now + RandomGenerator:NextNumber(
-						TURN_REACTION_MIN,
-						TURN_REACTION_MAX
-					)
-				end
-			end
-
-			state.lastBotMoveDirection = newMoveDirection
-			state.lastBotMotionTime = now
-		end
-	end
-
-	return now < state.turnReactionUntil
-end
-
-local function movementStep(deltaTime)
+local function movementStep()
 	if not state.alive then
 		return
 	end
@@ -517,39 +450,14 @@ local function movementStep(deltaTime)
 	local offset = targetRoot.Position - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
 	local distance = horizontalOffset.Magnitude
-	local reactingToTurn = observeSharpTurn(targetRoot, deltaTime)
 
 	state.movementLocked = true
-	if distance <= 0.001 then
+	if distance <= state.stopDistance or distance <= 0.001 then
 		humanoid:Move(Vector3.zero, false)
 		return
 	end
 
-	local towardDirection = horizontalOffset.Unit
-	local movementSign = 0
-	if distance > state.stopDistance + DISTANCE_TOLERANCE then
-		movementSign = 1
-	elseif distance < state.stopDistance - DISTANCE_TOLERANCE then
-		movementSign = -1
-	end
-
-	if movementSign == 0 then
-		if not reactingToTurn then
-			state.followDirection = towardDirection
-		end
-		humanoid:Move(Vector3.zero, false)
-		return
-	end
-
-	local dangerouslyClose = distance < MIN_STOP_DISTANCE - DISTANCE_TOLERANCE
-	local chosenTowardDirection = towardDirection
-	if reactingToTurn and state.followDirection and not dangerouslyClose then
-		chosenTowardDirection = state.followDirection
-	else
-		state.followDirection = towardDirection
-	end
-
-	humanoid:Move(chosenTowardDirection * movementSign, false)
+	humanoid:Move(horizontalOffset.Unit, false)
 end
 
 local function updateButtonText()
@@ -576,7 +484,6 @@ local function toggleTrack()
 		state.hasBomb = false
 		state.target = nil
 		state.distanceElapsed = 0
-		resetTurnTracking(nil)
 		releaseMovement()
 	end
 end
@@ -697,7 +604,6 @@ connect(workspace.DescendantRemoving, function(descendant)
 		state.candidates[descendant] = nil
 		if state.target == descendant then
 			state.target = nil
-			resetTurnTracking(nil)
 			releaseMovement()
 		end
 	end
@@ -707,7 +613,6 @@ connect(LocalPlayer.CharacterAdded, function()
 	state.hasBomb = false
 	state.target = nil
 	state.distanceElapsed = 0
-	resetTurnTracking(nil)
 	releaseMovement()
 end)
 
@@ -735,7 +640,6 @@ connect(RunService.Heartbeat, function(deltaTime)
 		local hadBomb = state.hasBomb
 		state.hasBomb = playerHasBomb()
 		if hadBomb ~= state.hasBomb then
-			resetTurnTracking(state.target)
 			if not state.hasBomb then
 				releaseMovement()
 			end
@@ -763,7 +667,6 @@ function state.cleanup()
 	state.hasBomb = false
 	state.target = nil
 	state.distanceElapsed = 0
-	resetTurnTracking(nil)
 	releaseMovement()
 
 	pcall(function()
@@ -793,4 +696,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[AutoTrack] Carregado: distancia aleatoria de 2.0 a 2.8 studs e reacao de curva de 0.4 a 0.6s.")
+warn("[AutoTrack] Carregado: segue ate a distancia aleatoria de 2.0 a 2.8 studs e aguarda parado.")
