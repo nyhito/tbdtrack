@@ -1,6 +1,6 @@
--- AutoTrack Mobile - detector de bots (versao de debug)
--- Base visual e comportamento de arraste adaptados do Cerber W.
--- Esta versao NAO move o personagem e NAO altera a camera.
+-- AutoTrack Mobile
+-- Segue o bot mais proximo somente enquanto a bomba estiver com o jogador.
+-- A camera permanece totalmente sob controle do jogador.
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -10,11 +10,37 @@ local RunService = game:GetService("RunService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+local Backpack = LocalPlayer:WaitForChild("Backpack")
 
 local GLOBAL_STATE_NAME = "__nt_autotrack_bot_debug"
-local UPDATE_INTERVAL = 0.15
+local SCREEN_GUI_NAME = "AutoTrackBotDebugMobile"
+local MOVE_BIND_NAME = "NT_AutoTrackMovement_" .. tostring(LocalPlayer.UserId)
+
+local STOP_DISTANCE = 0.65
+local TARGET_UPDATE_INTERVAL = 0.12
+local BOMB_CHECK_INTERVAL = 0.08
 local CACHE_REFRESH_INTERVAL = 1
 local DRAG_HOLD_TIME = 0.5
+
+local BOMB_NAME_HINTS = {
+	"bomb",
+	"bomba",
+	"tnt",
+	"explosive",
+}
+
+local BOMB_ATTRIBUTE_HINTS = {
+	"HasBomb",
+	"hasBomb",
+	"Bomb",
+	"bomb",
+	"HoldingBomb",
+	"holdingBomb",
+	"IsBombHolder",
+	"isBombHolder",
+	"HasTheBomb",
+	"hasTheBomb",
+}
 
 local environment = _G
 pcall(function()
@@ -28,13 +54,29 @@ if type(previousState) == "table" and type(previousState.cleanup) == "function" 
 	pcall(previousState.cleanup)
 end
 
+pcall(function()
+	RunService:UnbindFromRenderStep(MOVE_BIND_NAME)
+end)
+
+local oldGui = PlayerGui:FindFirstChild(SCREEN_GUI_NAME)
+if oldGui then
+	oldGui:Destroy()
+end
+
+-- Remove o contorno da antiga versao de debug, caso ainda exista.
+local oldHighlight = workspace:FindFirstChild("AutoTrackDebugTarget")
+if oldHighlight and oldHighlight:IsA("Highlight") then
+	oldHighlight:Destroy()
+end
+
 local state = {
 	alive = true,
 	enabled = false,
+	hasBomb = false,
+	movementLocked = false,
 	connections = {},
 	candidates = {},
 	target = nil,
-	distance = nil,
 }
 environment[GLOBAL_STATE_NAME] = state
 
@@ -44,13 +86,8 @@ local function connect(signal, callback)
 	return connection
 end
 
-local oldGui = PlayerGui:FindFirstChild("AutoTrackBotDebugMobile")
-if oldGui then
-	oldGui:Destroy()
-end
-
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "AutoTrackBotDebugMobile"
+ScreenGui.Name = SCREEN_GUI_NAME
 ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 1000
@@ -65,7 +102,7 @@ MobileButton.AutoButtonColor = false
 MobileButton.Text = "Track Off"
 MobileButton.TextColor3 = Color3.fromRGB(255, 255, 255)
 MobileButton.Font = Enum.Font.GothamBold
-MobileButton.TextSize = 15
+MobileButton.TextSize = 17
 MobileButton.TextWrapped = true
 MobileButton.TextStrokeTransparency = 1
 MobileButton.Active = true
@@ -116,38 +153,27 @@ end
 
 addTrueRoundedShadow(MobileButton, 14, 1.15, Color3.fromRGB(0, 0, 0))
 
-local TargetHighlight = Instance.new("Highlight")
-TargetHighlight.Name = "AutoTrackDebugTarget"
-TargetHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-TargetHighlight.FillColor = Color3.fromRGB(255, 255, 255)
-TargetHighlight.FillTransparency = 0.86
-TargetHighlight.OutlineColor = Color3.fromRGB(255, 255, 255)
-TargetHighlight.OutlineTransparency = 0.08
-TargetHighlight.Enabled = false
-local oldHighlight = workspace:FindFirstChild("AutoTrackDebugTarget")
-if oldHighlight and oldHighlight:IsA("Highlight") then
-	oldHighlight:Destroy()
-end
-TargetHighlight.Parent = workspace
-
-local function getLocalRoot()
+local function getLocalMover()
 	local character = LocalPlayer.Character
 	if not character then
-		return nil
+		return nil, nil
 	end
 
 	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	local root = humanoid and humanoid.RootPart
-	if root and root:IsA("BasePart") then
-		return root
+	if not humanoid or humanoid.Health <= 0 then
+		return nil, nil
 	end
 
-	root = character:FindFirstChild("HumanoidRootPart")
-	if root and root:IsA("BasePart") then
-		return root
+	local root = humanoid.RootPart
+	if not root or not root:IsA("BasePart") then
+		root = character:FindFirstChild("HumanoidRootPart")
 	end
 
-	return nil
+	if not root or not root:IsA("BasePart") then
+		return humanoid, nil
+	end
+
+	return humanoid, root
 end
 
 local function belongsToAPlayer(model)
@@ -199,12 +225,7 @@ local function inspectCandidate(model)
 		return nil
 	end
 
-	local root = getModelRoot(model, humanoid)
-	if not root then
-		return nil
-	end
-
-	return root
+	return getModelRoot(model, humanoid)
 end
 
 local function registerPossibleModel(instance)
@@ -239,101 +260,198 @@ local function refreshCandidateCache()
 end
 
 local function getNearestBot()
-	local localRoot = getLocalRoot()
+	local _, localRoot = getLocalMover()
 	if not localRoot then
-		return nil, nil, 0
+		return nil
 	end
 
 	local nearestModel = nil
 	local nearestDistance = math.huge
-	local validCount = 0
 
 	for model in pairs(state.candidates) do
 		local root = inspectCandidate(model)
 		if root then
-			validCount = validCount + 1
-			local distance = (root.Position - localRoot.Position).Magnitude
-			if distance < nearestDistance then
-				nearestDistance = distance
+			local offset = root.Position - localRoot.Position
+			local horizontalDistance = Vector3.new(offset.X, 0, offset.Z).Magnitude
+			if horizontalDistance < nearestDistance then
+				nearestDistance = horizontalDistance
 				nearestModel = model
 			end
 		end
 	end
 
-	if not nearestModel then
-		return nil, nil, validCount
+	return nearestModel
+end
+
+local function nameSuggestsBomb(name)
+	local loweredName = string.lower(tostring(name or ""))
+	for _, hint in ipairs(BOMB_NAME_HINTS) do
+		if string.find(loweredName, hint, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function hasBombAttribute(instance)
+	if not instance then
+		return false
 	end
 
-	return nearestModel, nearestDistance, validCount
-end
-
-local function shortenName(name)
-	name = tostring(name or "Bot")
-	if #name > 16 then
-		return string.sub(name, 1, 14) .. ".."
+	for _, attributeName in ipairs(BOMB_ATTRIBUTE_HINTS) do
+		local value = instance:GetAttribute(attributeName)
+		local loweredValue = type(value) == "string" and string.lower(value) or nil
+		if value == true
+			or value == 1
+			or value == LocalPlayer
+			or value == LocalPlayer.Name
+			or value == LocalPlayer.UserId
+			or loweredValue == "true" then
+			return true
+		end
 	end
-	return name
+
+	return false
 end
 
-local function setHighlight(model)
-	TargetHighlight.Adornee = model
-	TargetHighlight.Enabled = state.enabled and model ~= nil
+local function containerHasBomb(container)
+	if not container then
+		return false
+	end
+
+	if hasBombAttribute(container) then
+		return true
+	end
+
+	for _, descendant in ipairs(container:GetDescendants()) do
+		if hasBombAttribute(descendant) then
+			return true
+		end
+
+		if nameSuggestsBomb(descendant.Name) then
+			if descendant:IsA("Tool")
+				or descendant:IsA("Accessory")
+				or descendant:IsA("Model")
+				or descendant:IsA("BasePart")
+				or descendant:IsA("BoolValue")
+				or descendant:IsA("ObjectValue")
+				or descendant:IsA("StringValue") then
+				local disabledBool = descendant:IsA("BoolValue") and descendant.Value == false
+				if not disabledBool then
+					return true
+				end
+			end
+		end
+	end
+
+	return false
 end
 
-local function updateButtonText(validCount)
-	if not state.enabled then
-		MobileButton.Text = "Track Off"
+local function directPlayerValueHasBomb()
+	for _, child in ipairs(LocalPlayer:GetChildren()) do
+		if nameSuggestsBomb(child.Name) then
+			if child:IsA("BoolValue") and child.Value then
+				return true
+			elseif child:IsA("ObjectValue") then
+				if child.Value == LocalPlayer or child.Value == LocalPlayer.Character then
+					return true
+				end
+			elseif child:IsA("StringValue") then
+				local value = string.lower(child.Value)
+				if value == string.lower(LocalPlayer.Name) or value == "true" then
+					return true
+				end
+			elseif child:IsA("IntValue") or child:IsA("NumberValue") then
+				if child.Value == 1 or child.Value == LocalPlayer.UserId then
+					return true
+				end
+			end
+		end
+	end
+
+	return false
+end
+
+local function playerHasBomb()
+	local character = LocalPlayer.Character
+	return hasBombAttribute(LocalPlayer)
+		or directPlayerValueHasBomb()
+		or containerHasBomb(character)
+		or containerHasBomb(Backpack)
+end
+
+local function releaseMovement()
+	if not state.movementLocked then
 		return
 	end
 
-	if not state.target then
-		MobileButton.Text = "Track On\nNo Bot"
-		return
-	end
-
-	local roundedDistance = math.floor((state.distance or 0) + 0.5)
-	MobileButton.Text = "Track On\n" .. shortenName(state.target.Name) .. " - " .. roundedDistance .. "st"
-
-	if validCount and validCount > 1 then
-		MobileButton.Text = MobileButton.Text .. " (" .. validCount .. ")"
+	state.movementLocked = false
+	local humanoid = getLocalMover()
+	if humanoid then
+		humanoid:Move(Vector3.zero, false)
 	end
 end
 
-local function printTargetChange(newTarget, distance, validCount)
-	if newTarget then
-		local fullName = newTarget.Name
-		pcall(function()
-			fullName = newTarget:GetFullName()
-		end)
-		warn(string.format(
-			"[AutoTrack Debug] Bot mais proximo: %s | distancia: %.1f studs | bots validos: %d",
-			fullName,
-			distance or 0,
-			validCount or 0
-		))
-	else
-		warn("[AutoTrack Debug] Nenhum Model com Humanoid, vivo e sem Player associado foi encontrado.")
-	end
-end
-
-local function updateDetection(forcePrint)
+local function updateTarget()
 	if not state.enabled then
 		state.target = nil
-		state.distance = nil
-		setHighlight(nil)
-		updateButtonText(0)
 		return
 	end
 
-	local previousTarget = state.target
-	local target, distance, validCount = getNearestBot()
-	state.target = target
-	state.distance = distance
-	setHighlight(target)
-	updateButtonText(validCount)
+	state.target = getNearestBot()
+end
 
-	if forcePrint or target ~= previousTarget then
-		printTargetChange(target, distance, validCount)
+local function movementStep()
+	if not state.alive then
+		return
+	end
+
+	if not state.enabled or not state.hasBomb or not state.target then
+		releaseMovement()
+		return
+	end
+
+	local humanoid, localRoot = getLocalMover()
+	local targetRoot = inspectCandidate(state.target)
+	if not humanoid or not localRoot or not targetRoot then
+		releaseMovement()
+		return
+	end
+
+	local offset = targetRoot.Position - localRoot.Position
+	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
+	local distance = horizontalOffset.Magnitude
+
+	state.movementLocked = true
+	if distance > STOP_DISTANCE then
+		humanoid:Move(horizontalOffset.Unit, false)
+	else
+		humanoid:Move(Vector3.zero, false)
+	end
+end
+
+local function updateButtonText()
+	MobileButton.Text = state.enabled and "Track On" or "Track Off"
+end
+
+local function toggleTrack()
+	state.enabled = not state.enabled
+	updateButtonText()
+
+	TweenService:Create(
+		MobileButton,
+		TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{BackgroundColor3 = state.enabled and Color3.fromRGB(8, 8, 8) or Color3.fromRGB(0, 0, 0)}
+	):Play()
+
+	if state.enabled then
+		state.hasBomb = playerHasBomb()
+		refreshCandidateCache()
+		updateTarget()
+	else
+		state.hasBomb = false
+		state.target = nil
+		releaseMovement()
 	end
 end
 
@@ -343,24 +461,6 @@ local function animateButtonPress(pressed)
 		TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
 		{Scale = pressed and 0.96 or 1}
 	):Play()
-end
-
-local function toggleDetection()
-	state.enabled = not state.enabled
-
-	TweenService:Create(
-		MobileButton,
-		TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
-		{BackgroundColor3 = state.enabled and Color3.fromRGB(8, 8, 8) or Color3.fromRGB(0, 0, 0)}
-	):Play()
-
-	if state.enabled then
-		refreshCandidateCache()
-		updateDetection(true)
-	else
-		updateDetection(false)
-		warn("[AutoTrack Debug] Detector desligado.")
-	end
 end
 
 local function clampButtonToScreen(position)
@@ -454,7 +554,7 @@ connect(UserInputService.InputEnded, function(input)
 	animateButtonPress(false)
 
 	if not wasLongHold and not wasMoved then
-		toggleDetection()
+		toggleTrack()
 	end
 end)
 
@@ -471,58 +571,49 @@ connect(workspace.DescendantRemoving, function(descendant)
 		state.candidates[descendant] = nil
 		if state.target == descendant then
 			state.target = nil
-			state.distance = nil
-			setHighlight(nil)
+			releaseMovement()
 		end
 	end
 end)
 
-local detectionElapsed = 0
+connect(LocalPlayer.CharacterAdded, function()
+	state.hasBomb = false
+	state.target = nil
+	releaseMovement()
+end)
+
+local targetElapsed = 0
+local bombElapsed = 0
 local cacheElapsed = 0
+
 connect(RunService.Heartbeat, function(deltaTime)
-	if not state.alive then
+	if not state.alive or not state.enabled then
 		return
 	end
 
-	detectionElapsed = detectionElapsed + deltaTime
+	targetElapsed = targetElapsed + deltaTime
+	bombElapsed = bombElapsed + deltaTime
 	cacheElapsed = cacheElapsed + deltaTime
 
-	if state.enabled and cacheElapsed >= CACHE_REFRESH_INTERVAL then
+	if bombElapsed >= BOMB_CHECK_INTERVAL then
+		bombElapsed = 0
+		local hadBomb = state.hasBomb
+		state.hasBomb = playerHasBomb()
+		if hadBomb and not state.hasBomb then
+			releaseMovement()
+		end
+	end
+
+	if cacheElapsed >= CACHE_REFRESH_INTERVAL then
 		cacheElapsed = 0
 		refreshCandidateCache()
 	end
 
-	if state.enabled and detectionElapsed >= UPDATE_INTERVAL then
-		detectionElapsed = 0
-		updateDetection(false)
+	if targetElapsed >= TARGET_UPDATE_INTERVAL then
+		targetElapsed = 0
+		updateTarget()
 	end
 end)
-
-function state.getSnapshot()
-	local snapshot = {
-		enabled = state.enabled,
-		target = state.target and state.target:GetFullName() or nil,
-		distance = state.distance,
-		candidates = {},
-	}
-
-	local localRoot = getLocalRoot()
-	for model in pairs(state.candidates) do
-		local root = inspectCandidate(model)
-		if root then
-			table.insert(snapshot.candidates, {
-				name = model:GetFullName(),
-				distance = localRoot and (root.Position - localRoot.Position).Magnitude or nil,
-			})
-		end
-	end
-
-	table.sort(snapshot.candidates, function(a, b)
-		return (a.distance or math.huge) < (b.distance or math.huge)
-	end)
-
-	return snapshot
-end
 
 function state.cleanup()
 	if not state.alive then
@@ -530,6 +621,15 @@ function state.cleanup()
 	end
 
 	state.alive = false
+	state.enabled = false
+	state.hasBomb = false
+	state.target = nil
+	releaseMovement()
+
+	pcall(function()
+		RunService:UnbindFromRenderStep(MOVE_BIND_NAME)
+	end)
+
 	for _, connection in ipairs(state.connections) do
 		pcall(function()
 			connection:Disconnect()
@@ -540,8 +640,10 @@ function state.cleanup()
 	if ScreenGui then
 		ScreenGui:Destroy()
 	end
-	if TargetHighlight then
-		TargetHighlight:Destroy()
+
+	local leftoverHighlight = workspace:FindFirstChild("AutoTrackDebugTarget")
+	if leftoverHighlight and leftoverHighlight:IsA("Highlight") then
+		leftoverHighlight:Destroy()
 	end
 
 	if environment[GLOBAL_STATE_NAME] == state then
@@ -550,4 +652,5 @@ function state.cleanup()
 end
 
 refreshCandidateCache()
-warn("[AutoTrack Debug] Carregado. Toque para detectar; segure por 0.5s e arraste para mover o botao.")
+RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
+warn("[AutoTrack] Carregado: segue o bot mais proximo a 0.65 stud quando a bomba estiver com voce.")
