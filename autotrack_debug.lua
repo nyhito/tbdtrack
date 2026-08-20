@@ -80,6 +80,10 @@ local CAMERA_FLICK_COOLDOWN = 0.18
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
 local CAMERA_ENGAGE_DURATION_MIN = 0.18
 local CAMERA_ENGAGE_DURATION_MAX = 0.28
+local CAMERA_ENGAGE_SLOW_CHANCE = 0.3
+local CAMERA_ENGAGE_FAST_DURATION_MIN = 0.04
+local CAMERA_ENGAGE_FAST_DURATION_MAX = 0.1
+local CAMERA_ENGAGE_FAST_BIAS_POWER = 2.2
 
 local SHARP_TURN_THRESHOLD_DEGREES = 52
 local SHARP_TURN_DISTANCE_MIN = 2
@@ -97,6 +101,21 @@ local BOMB_CHECK_INTERVAL = 0.08
 local CACHE_REFRESH_INTERVAL = 1
 local DRAG_HOLD_TIME = 0.5
 local RandomGenerator = Random.new()
+
+local function getCameraEngageDuration()
+	if RandomGenerator:NextNumber(0, 1) < CAMERA_ENGAGE_SLOW_CHANCE then
+		return RandomGenerator:NextNumber(
+			CAMERA_ENGAGE_DURATION_MIN,
+			CAMERA_ENGAGE_DURATION_MAX
+		)
+	end
+
+	local sample = RandomGenerator:NextNumber(0, 1)
+	local biasedSample = sample ^ CAMERA_ENGAGE_FAST_BIAS_POWER
+	return CAMERA_ENGAGE_FAST_DURATION_MIN
+		+ ((CAMERA_ENGAGE_FAST_DURATION_MAX
+			- CAMERA_ENGAGE_FAST_DURATION_MIN) * biasedSample)
+end
 
 local function getBiasedTrackDistance()
 	local sample = RandomGenerator:NextNumber(0, 1)
@@ -1065,10 +1084,7 @@ local function movementStep(deltaTime)
 		state.cameraEngageActive = true
 		state.cameraEngageElapsed = 0
 		state.cameraEngageStartCFrame = nil
-		state.cameraEngageDuration = RandomGenerator:NextNumber(
-			CAMERA_ENGAGE_DURATION_MIN,
-			CAMERA_ENGAGE_DURATION_MAX
-		)
+		state.cameraEngageDuration = getCameraEngageDuration()
 	end
 
 	local offset = targetRoot.Position - localRoot.Position
