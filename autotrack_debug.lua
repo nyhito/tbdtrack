@@ -27,19 +27,56 @@ local MICRO_OFFSET_BASE = 0.008
 local MICRO_OFFSET_VARIATION = 0.003
 local MICRO_MOVE_MIN = 0.01
 local MICRO_MOVE_MAX = 0.26
-local INNER_RECOVERY_TRIGGER_DISTANCE = 1.2
+local INNER_RECOVERY_TRIGGER_DISTANCE = 1.8
 local INNER_RECOVERY_TARGET_MIN = 2.05
 local INNER_RECOVERY_TARGET_MAX = 2.2
+local INNER_RECOVERY_NEXT_DISTANCE_MIN = 2.02
+local INNER_RECOVERY_NEXT_DISTANCE_MAX = 2.38
 local INNER_RECOVERY_MOVE_MIN = 0.14
 local INNER_RECOVERY_MOVE_MAX = 0.28
 local MANUAL_MOVE_WEIGHT = 0.1
 local MANUAL_OUTER_GUARD_DISTANCE = 2.85
 
+local AIM_MIN_ABSOLUTE_OFFSET = 0.14
+local AIM_NEAR_MAX_OFFSET = 0.58
+local AIM_MIDDLE_MAX_OFFSET = 0.98
+local AIM_EDGE_MAX_OFFSET = 1.35
+local AIM_NEAR_CHANCE = 0.55
+local AIM_MIDDLE_CHANCE = 0.86
+local AIM_CHANGE_MIN = 0.22
+local AIM_CHANGE_MAX = 0.55
+local AIM_EDGE_CHANGE_MIN = 0.1
+local AIM_EDGE_CHANGE_MAX = 0.16
+local AIM_RETURN_CHANGE_MIN = 0.16
+local AIM_RETURN_CHANGE_MAX = 0.3
+local AIM_SMOOTH_SPEED = 18
+
 local TRACK_HORIZONTAL_OFFSET_DEGREES = 35
 local CAMERA_HORIZONTAL_LIMIT_DEGREES = 8
-local CAMERA_TOUCH_SENSITIVITY = 0.06
-local CAMERA_TOUCH_REGION_START = 0.34
+local CAMERA_TOTAL_OFFSET_LIMIT_DEGREES = 15
+local CAMERA_TOUCH_SENSITIVITY = 0.075
+local CAMERA_TOUCH_REGION_START = 0.3
 local CAMERA_MANUAL_SMOOTH_SPEED = 14
+local CAMERA_BASE_ERROR_LIMIT_DEGREES = 5
+local CAMERA_BASE_MIN_ABSOLUTE_DEGREES = 0.35
+local CAMERA_BASE_CHANGE_MIN = 0.22
+local CAMERA_BASE_CHANGE_MAX = 0.58
+local CAMERA_BASE_SMOOTH_SPEED = 8.5
+local CAMERA_MICRO_PRIMARY_DEGREES = 0.14
+local CAMERA_MICRO_SECONDARY_DEGREES = 0.06
+local CAMERA_MICRO_PRIMARY_SPEED = 2.1
+local CAMERA_MICRO_SECONDARY_SPEED = 0.83
+local CAMERA_FLICK_ROUTINE_MIN = 0.8
+local CAMERA_FLICK_ROUTINE_MAX = 1.6
+local CAMERA_FLICK_LIGHT_MIN = 0.5
+local CAMERA_FLICK_LIGHT_MAX = 1.4
+local CAMERA_FLICK_TURN_MIN = 2.2
+local CAMERA_FLICK_TURN_MAX = 4.6
+local CAMERA_FLICK_DURATION_MIN = 0.08
+local CAMERA_FLICK_DURATION_MAX = 0.15
+local CAMERA_FLICK_TURN_THRESHOLD_DEGREES = 26
+local CAMERA_FLICK_SAMPLE_DISTANCE = 0.08
+local CAMERA_FLICK_COOLDOWN = 0.18
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
 local CHARACTER_TURN_SMOOTH_SPEED = 10
 local TARGET_UPDATE_INTERVAL = 0.12
@@ -115,15 +152,43 @@ local state = {
 	microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1,
 	microPhase = RandomGenerator:NextNumber(0, math.pi * 2),
 	microFrequency = RandomGenerator:NextNumber(0.72, 1.08),
+	aimTargetOffset = (RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1)
+		* RandomGenerator:NextNumber(0.2, 0.5),
+	aimAppliedOffset = 0.24,
+	aimElapsed = 0,
+	aimChangeInterval = RandomGenerator:NextNumber(AIM_CHANGE_MIN, AIM_CHANGE_MAX),
+	aimReturnFromEdge = false,
 	innerRecoveryActive = false,
 	innerRecoveryTarget = INNER_RECOVERY_TARGET_MIN,
 	cameraRequestedOffsetDegrees = 0,
 	cameraAppliedOffsetDegrees = 0,
+	cameraBaseTargetOffsetDegrees = 1.25,
+	cameraBaseAppliedOffsetDegrees = 1.25,
+	cameraBaseElapsed = 0,
+	cameraBaseChangeInterval = RandomGenerator:NextNumber(
+		CAMERA_BASE_CHANGE_MIN,
+		CAMERA_BASE_CHANGE_MAX
+	),
+	cameraMicroPhaseA = RandomGenerator:NextNumber(0, math.pi * 2),
+	cameraMicroPhaseB = RandomGenerator:NextNumber(0, math.pi * 2),
+	cameraFlickElapsed = 1,
+	cameraFlickDuration = 1,
+	cameraFlickAmplitude = 0,
+	cameraFlickOffsetDegrees = 0,
+	cameraFlickRoutineElapsed = 0,
+	cameraFlickRoutineInterval = RandomGenerator:NextNumber(
+		CAMERA_FLICK_ROUTINE_MIN,
+		CAMERA_FLICK_ROUTINE_MAX
+	),
+	cameraFlickCooldown = 0,
+	cameraLastBotSamplePosition = nil,
+	cameraLastBotMoveDirection = nil,
 	cameraTouchInput = nil,
 	cameraTouchLastPosition = nil,
 	controlledHumanoid = nil,
 	savedAutoRotate = nil,
 }
+state.aimAppliedOffset = state.aimTargetOffset
 environment[GLOBAL_STATE_NAME] = state
 
 local function connect(signal, callback)
@@ -464,8 +529,13 @@ local function releaseTrackingControl()
 	releaseMovement()
 	restoreCharacterFacing()
 	state.innerRecoveryActive = false
+	state.aimElapsed = state.aimChangeInterval
 	state.cameraRequestedOffsetDegrees = 0
 	state.cameraAppliedOffsetDegrees = 0
+	state.cameraFlickOffsetDegrees = 0
+	state.cameraFlickElapsed = state.cameraFlickDuration
+	state.cameraLastBotSamplePosition = nil
+	state.cameraLastBotMoveDirection = nil
 end
 
 local function randomizeStopDistance()
@@ -500,6 +570,9 @@ local function updateTarget()
 	local nextTarget = getNearestBot()
 	if nextTarget ~= state.target then
 		state.innerRecoveryActive = false
+		state.aimElapsed = state.aimChangeInterval
+		state.cameraLastBotSamplePosition = nil
+		state.cameraLastBotMoveDirection = nil
 	end
 	state.target = nextTarget
 end
@@ -515,8 +588,237 @@ local function rotateHorizontalLeft(direction, degrees)
 	):VectorToWorldSpace(direction)
 end
 
-local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
-	local offset = targetRoot.Position - localRoot.Position
+local function getDirectionSign(value)
+	return value >= 0 and 1 or -1
+end
+
+local function randomizeAimTarget()
+	local previousTarget = state.aimTargetOffset or AIM_MIN_ABSOLUTE_OFFSET
+	local previousSign = getDirectionSign(previousTarget)
+	local nextSign = previousSign
+	local magnitude = AIM_MIN_ABSOLUTE_OFFSET
+
+	if state.aimReturnFromEdge then
+		-- Depois de mirar perto de um braco, cruza rapidamente para o outro lado.
+		nextSign = -previousSign
+		magnitude = RandomGenerator:NextNumber(0.22, 0.72)
+		state.aimChangeInterval = RandomGenerator:NextNumber(
+			AIM_RETURN_CHANGE_MIN,
+			AIM_RETURN_CHANGE_MAX
+		)
+		state.aimReturnFromEdge = false
+	else
+		local roll = RandomGenerator:NextNumber(0, 1)
+		if roll < AIM_NEAR_CHANCE then
+			magnitude = RandomGenerator:NextNumber(
+				AIM_MIN_ABSOLUTE_OFFSET,
+				AIM_NEAR_MAX_OFFSET
+			)
+		elseif roll < AIM_MIDDLE_CHANCE then
+			magnitude = RandomGenerator:NextNumber(
+				AIM_NEAR_MAX_OFFSET,
+				AIM_MIDDLE_MAX_OFFSET
+			)
+		else
+			magnitude = RandomGenerator:NextNumber(
+				AIM_MIDDLE_MAX_OFFSET,
+				AIM_EDGE_MAX_OFFSET
+			)
+			state.aimReturnFromEdge = true
+		end
+
+		if RandomGenerator:NextNumber(0, 1) < 0.62 then
+			nextSign = -previousSign
+		else
+			nextSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1
+		end
+
+		if state.aimReturnFromEdge then
+			state.aimChangeInterval = RandomGenerator:NextNumber(
+				AIM_EDGE_CHANGE_MIN,
+				AIM_EDGE_CHANGE_MAX
+			)
+		else
+			state.aimChangeInterval = RandomGenerator:NextNumber(
+				AIM_CHANGE_MIN,
+				AIM_CHANGE_MAX
+			)
+		end
+	end
+
+	local nextTarget = nextSign * magnitude
+	if math.abs(nextTarget - previousTarget) < 0.12 then
+		nextTarget = -previousSign * math.max(
+			AIM_MIN_ABSOLUTE_OFFSET,
+			magnitude
+		)
+	end
+
+	state.aimTargetOffset = nextTarget
+	state.aimElapsed = 0
+end
+
+local function updateAimPosition(targetRoot, deltaTime)
+	state.aimElapsed = state.aimElapsed + deltaTime
+	if state.aimElapsed >= state.aimChangeInterval then
+		randomizeAimTarget()
+	end
+
+	local alpha = getSmoothAlpha(AIM_SMOOTH_SPEED, deltaTime)
+	local appliedOffset = state.aimAppliedOffset
+		+ ((state.aimTargetOffset - state.aimAppliedOffset) * alpha)
+	if math.abs(appliedOffset) < AIM_MIN_ABSOLUTE_OFFSET then
+		appliedOffset = getDirectionSign(state.aimTargetOffset)
+			* AIM_MIN_ABSOLUTE_OFFSET
+	end
+	state.aimAppliedOffset = appliedOffset
+
+	local right = targetRoot.CFrame.RightVector
+	local horizontalRight = Vector3.new(right.X, 0, right.Z)
+	if horizontalRight.Magnitude <= 0.001 then
+		return targetRoot.Position
+	end
+
+	return targetRoot.Position + (horizontalRight.Unit * appliedOffset)
+end
+
+local function randomizeCameraBaseOffset()
+	local previousOffset = state.cameraBaseTargetOffsetDegrees or 0
+	local nextOffset = previousOffset
+
+	for _ = 1, 8 do
+		nextOffset = RandomGenerator:NextNumber(
+			-CAMERA_BASE_ERROR_LIMIT_DEGREES,
+			CAMERA_BASE_ERROR_LIMIT_DEGREES
+		)
+		if math.abs(nextOffset) >= CAMERA_BASE_MIN_ABSOLUTE_DEGREES
+			and math.abs(nextOffset - previousOffset) >= 0.65 then
+			break
+		end
+	end
+
+	if math.abs(nextOffset) < CAMERA_BASE_MIN_ABSOLUTE_DEGREES then
+		nextOffset = getDirectionSign(nextOffset)
+			* CAMERA_BASE_MIN_ABSOLUTE_DEGREES
+	end
+	if math.abs(nextOffset - previousOffset) < 0.65 then
+		nextOffset = -getDirectionSign(previousOffset)
+			* RandomGenerator:NextNumber(
+				CAMERA_BASE_MIN_ABSOLUTE_DEGREES + 0.3,
+				CAMERA_BASE_ERROR_LIMIT_DEGREES
+			)
+	end
+
+	state.cameraBaseTargetOffsetDegrees = nextOffset
+	state.cameraBaseElapsed = 0
+	state.cameraBaseChangeInterval = RandomGenerator:NextNumber(
+		CAMERA_BASE_CHANGE_MIN,
+		CAMERA_BASE_CHANGE_MAX
+	)
+end
+
+local function startCameraFlick(minimumAmplitude, maximumAmplitude)
+	local sign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1
+	state.cameraFlickAmplitude = sign
+		* RandomGenerator:NextNumber(minimumAmplitude, maximumAmplitude)
+	state.cameraFlickDuration = RandomGenerator:NextNumber(
+		CAMERA_FLICK_DURATION_MIN,
+		CAMERA_FLICK_DURATION_MAX
+	)
+	state.cameraFlickElapsed = 0
+	state.cameraFlickCooldown = CAMERA_FLICK_COOLDOWN
+end
+
+local function updateCameraVariation(targetRoot, deltaTime)
+	state.cameraBaseElapsed = state.cameraBaseElapsed + deltaTime
+	if state.cameraBaseElapsed >= state.cameraBaseChangeInterval then
+		randomizeCameraBaseOffset()
+	end
+
+	local baseAlpha = getSmoothAlpha(CAMERA_BASE_SMOOTH_SPEED, deltaTime)
+	state.cameraBaseAppliedOffsetDegrees = state.cameraBaseAppliedOffsetDegrees
+		+ ((state.cameraBaseTargetOffsetDegrees
+			- state.cameraBaseAppliedOffsetDegrees) * baseAlpha)
+
+	state.cameraFlickCooldown = math.max(
+		0,
+		state.cameraFlickCooldown - deltaTime
+	)
+	local targetPosition = targetRoot.Position
+	if not state.cameraLastBotSamplePosition then
+		state.cameraLastBotSamplePosition = targetPosition
+	else
+		local displacement = targetPosition - state.cameraLastBotSamplePosition
+		local horizontalDisplacement = Vector3.new(
+			displacement.X,
+			0,
+			displacement.Z
+		)
+		if horizontalDisplacement.Magnitude >= CAMERA_FLICK_SAMPLE_DISTANCE then
+			local moveDirection = horizontalDisplacement.Unit
+			if state.cameraLastBotMoveDirection
+				and state.cameraFlickCooldown <= 0 then
+				local directionDot = math.clamp(
+					state.cameraLastBotMoveDirection:Dot(moveDirection),
+					-1,
+					1
+				)
+				local turnDegrees = math.deg(math.acos(directionDot))
+				if turnDegrees >= CAMERA_FLICK_TURN_THRESHOLD_DEGREES then
+					startCameraFlick(
+						CAMERA_FLICK_TURN_MIN,
+						CAMERA_FLICK_TURN_MAX
+					)
+				end
+			end
+			state.cameraLastBotMoveDirection = moveDirection
+			state.cameraLastBotSamplePosition = targetPosition
+		end
+	end
+
+	state.cameraFlickRoutineElapsed = state.cameraFlickRoutineElapsed + deltaTime
+	if state.cameraFlickRoutineElapsed >= state.cameraFlickRoutineInterval then
+		state.cameraFlickRoutineElapsed = 0
+		state.cameraFlickRoutineInterval = RandomGenerator:NextNumber(
+			CAMERA_FLICK_ROUTINE_MIN,
+			CAMERA_FLICK_ROUTINE_MAX
+		)
+		if state.cameraFlickCooldown <= 0 then
+			startCameraFlick(
+				CAMERA_FLICK_LIGHT_MIN,
+				CAMERA_FLICK_LIGHT_MAX
+			)
+		end
+	end
+
+	state.cameraFlickElapsed = state.cameraFlickElapsed + deltaTime
+	if state.cameraFlickElapsed < state.cameraFlickDuration then
+		local progress = math.clamp(
+			state.cameraFlickElapsed / state.cameraFlickDuration,
+			0,
+			1
+		)
+		state.cameraFlickOffsetDegrees = state.cameraFlickAmplitude
+			* math.sin(math.pi * progress)
+	else
+		state.cameraFlickOffsetDegrees = 0
+	end
+
+	local now = os.clock()
+	local microOffset = math.sin(
+		(now * CAMERA_MICRO_PRIMARY_SPEED) + state.cameraMicroPhaseA
+	) * CAMERA_MICRO_PRIMARY_DEGREES
+	microOffset = microOffset + (math.sin(
+		(now * CAMERA_MICRO_SECONDARY_SPEED) + state.cameraMicroPhaseB
+	) * CAMERA_MICRO_SECONDARY_DEGREES)
+
+	return state.cameraBaseAppliedOffsetDegrees,
+		state.cameraFlickOffsetDegrees,
+		microOffset
+end
+
+local function updateCharacterFacing(humanoid, localRoot, aimPosition, deltaTime)
+	local offset = aimPosition - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
 	if horizontalOffset.Magnitude <= 0.001 then
 		return
@@ -541,13 +843,13 @@ local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
 	localRoot.CFrame = localRoot.CFrame:Lerp(desiredFacing, alpha)
 end
 
-local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
+local function updateTrackingCamera(localRoot, targetRoot, aimPosition, deltaTime)
 	local camera = workspace.CurrentCamera
 	if not camera then
 		return
 	end
 
-	local offset = targetRoot.Position - localRoot.Position
+	local offset = aimPosition - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
 	if horizontalOffset.Magnitude <= 0.001 then
 		return
@@ -561,16 +863,26 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	)
 	local currentOffset = state.cameraAppliedOffsetDegrees or 0
 	local alpha = getSmoothAlpha(CAMERA_MANUAL_SMOOTH_SPEED, deltaTime)
-	local limitedOffset = currentOffset + ((requestedOffset - currentOffset) * alpha)
-	state.cameraAppliedOffsetDegrees = limitedOffset
+	local manualOffset = currentOffset + ((requestedOffset - currentOffset) * alpha)
+	state.cameraAppliedOffsetDegrees = manualOffset
+
+	local baseOffset, flickOffset, microCameraOffset = updateCameraVariation(
+		targetRoot,
+		deltaTime
+	)
+	local combinedOffset = math.clamp(
+		manualOffset + baseOffset + flickOffset + microCameraOffset,
+		-CAMERA_TOTAL_OFFSET_LIMIT_DEGREES,
+		CAMERA_TOTAL_OFFSET_LIMIT_DEGREES
+	)
 
 	local limitedForward = rotateHorizontalLeft(
 		towardTarget,
-		TRACK_HORIZONTAL_OFFSET_DEGREES + limitedOffset
+		TRACK_HORIZONTAL_OFFSET_DEGREES + combinedOffset
 	)
 
 	-- Usa a distancia, o zoom e a inclinacao vertical produzidos pela camera
-	-- normal. O arraste horizontal mobile controla um pequeno desvio dos 35 graus.
+	-- normal. Arraste, erro-base e flick trabalham separadamente na horizontal.
 	local focus = camera.Focus.Position
 	local cameraOffset = camera.CFrame.Position - focus
 	local verticalOffset = cameraOffset.Y
@@ -662,12 +974,17 @@ local function movementStep(deltaTime)
 		return
 	end
 
-	updateTrackingCamera(localRoot, targetRoot, deltaTime)
-	updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
+	local aimPosition = updateAimPosition(targetRoot, deltaTime)
+	updateTrackingCamera(localRoot, targetRoot, aimPosition, deltaTime)
+	updateCharacterFacing(humanoid, localRoot, aimPosition, deltaTime)
 
 	local towardTarget = horizontalOffset.Unit
 	local fromTarget = -towardTarget
 	local tangent = Vector3.new(-fromTarget.Z, 0, fromTarget.X) * state.microSign
+	local aimShiftRaw = aimPosition - targetRoot.Position
+	local aimShift = Vector3.new(aimShiftRaw.X, 0, aimShiftRaw.Z)
+	local towardAimRaw = aimPosition - localRoot.Position
+	local towardAim = Vector3.new(towardAimRaw.X, 0, towardAimRaw.Z)
 	local now = os.clock()
 	local microOffset = MICRO_OFFSET_BASE
 		+ (math.sin((now * state.microFrequency) + state.microPhase) * MICRO_OFFSET_VARIATION)
@@ -685,7 +1002,10 @@ local function movementStep(deltaTime)
 	if state.innerRecoveryActive then
 		if distance >= state.innerRecoveryTarget then
 			state.innerRecoveryActive = false
-			state.stopDistance = getBiasedTrackDistance()
+			state.stopDistance = RandomGenerator:NextNumber(
+				INNER_RECOVERY_NEXT_DISTANCE_MIN,
+				INNER_RECOVERY_NEXT_DISTANCE_MAX
+			)
 			movementVector = (tangent * MICRO_MOVE_MIN)
 				+ (fromTarget * (MICRO_MOVE_MIN * 0.25))
 		else
@@ -699,7 +1019,9 @@ local function movementStep(deltaTime)
 			movementVector = recoveryDirection.Unit * recoveryStrength
 		end
 	elseif distance > MAX_STOP_DISTANCE then
-		movementVector = towardTarget
+		movementVector = towardAim.Magnitude > 0.001
+			and towardAim.Unit
+			or towardTarget
 	elseif distance < MIN_STOP_DISTANCE then
 		local correction = fromTarget + (tangent * microOffset)
 		movementVector = correction.Unit * INNER_RECOVERY_MOVE_MAX
@@ -709,9 +1031,15 @@ local function movementStep(deltaTime)
 			INNER_GUARD_DISTANCE,
 			OUTER_GUARD_DISTANCE
 		)
-		local desiredPosition = targetRoot.Position
-			+ (fromTarget * desiredDistance)
+		local desiredFromCenter = (fromTarget * desiredDistance)
+			+ aimShift
 			+ (tangent * microOffset)
+		if desiredFromCenter.Magnitude > OUTER_GUARD_DISTANCE then
+			desiredFromCenter = desiredFromCenter.Unit * OUTER_GUARD_DISTANCE
+		elseif desiredFromCenter.Magnitude < INNER_GUARD_DISTANCE then
+			desiredFromCenter = desiredFromCenter.Unit * INNER_GUARD_DISTANCE
+		end
+		local desiredPosition = targetRoot.Position + desiredFromCenter
 		local desiredOffset = desiredPosition - localRoot.Position
 		local horizontalDesiredOffset = Vector3.new(desiredOffset.X, 0, desiredOffset.Z)
 
@@ -758,8 +1086,27 @@ local function toggleTrack()
 		state.microPhase = RandomGenerator:NextNumber(0, math.pi * 2)
 		state.microFrequency = RandomGenerator:NextNumber(0.72, 1.08)
 		state.innerRecoveryActive = false
+		state.aimReturnFromEdge = false
+		randomizeAimTarget()
+		state.aimAppliedOffset = state.aimTargetOffset
 		state.cameraRequestedOffsetDegrees = 0
 		state.cameraAppliedOffsetDegrees = 0
+		randomizeCameraBaseOffset()
+		state.cameraBaseAppliedOffsetDegrees = state.cameraBaseTargetOffsetDegrees
+		state.cameraFlickElapsed = state.cameraFlickDuration
+		state.cameraFlickOffsetDegrees = 0
+		state.cameraFlickRoutineElapsed = 0
+		state.cameraFlickRoutineInterval = RandomGenerator:NextNumber(
+			CAMERA_FLICK_ROUTINE_MIN,
+			CAMERA_FLICK_ROUTINE_MAX
+		)
+		state.cameraFlickCooldown = 0
+		state.cameraMicroPhaseA = RandomGenerator:NextNumber(0, math.pi * 2)
+		state.cameraMicroPhaseB = RandomGenerator:NextNumber(0, math.pi * 2)
+		state.cameraLastBotSamplePosition = nil
+		state.cameraLastBotMoveDirection = nil
+		state.cameraTouchInput = nil
+		state.cameraTouchLastPosition = nil
 		state.hasBomb = playerHasBomb()
 		refreshCandidateCache()
 		updateTarget()
@@ -883,30 +1230,48 @@ local function isPointInsideTrackButton(position)
 		and position.Y <= buttonPosition.Y + buttonSize.Y
 end
 
--- Le diretamente o arraste mobile para que a camera horizontal responda mesmo
--- depois que o CFrame e limitado perto do angulo de 35 graus.
-connect(UserInputService.TouchStarted, function(input, gameProcessedEvent)
-	if gameProcessedEvent or not state.enabled or isPointInsideTrackButton(input.Position) then
-		return
+local function tryBeginCameraTouch(input, initialPosition)
+	if input.UserInputType ~= Enum.UserInputType.Touch
+		or state.cameraTouchInput
+		or not state.enabled
+		or input == activeInput
+		or isPointInsideTrackButton(initialPosition) then
+		return false
 	end
 
 	local camera = workspace.CurrentCamera
 	if not camera
-		or input.Position.X < (camera.ViewportSize.X * CAMERA_TOUCH_REGION_START)
-		or state.cameraTouchInput then
-		return
+		or initialPosition.X < (camera.ViewportSize.X * CAMERA_TOUCH_REGION_START) then
+		return false
 	end
 
 	state.cameraTouchInput = input
-	state.cameraTouchLastPosition = input.Position
+	state.cameraTouchLastPosition = initialPosition
+	return true
+end
+
+-- Captura o toque pelos eventos gerais para nao depender da camera padrao do
+-- jogo ou do sinal TouchMoved do executor.
+connect(UserInputService.InputBegan, function(input)
+	tryBeginCameraTouch(input, input.Position)
 end)
 
-connect(UserInputService.TouchMoved, function(input)
-	if input ~= state.cameraTouchInput or not state.cameraTouchLastPosition then
+connect(UserInputService.InputChanged, function(input)
+	if input.UserInputType ~= Enum.UserInputType.Touch then
 		return
 	end
 
-	local delta = input.Position - state.cameraTouchLastPosition
+	if not state.cameraTouchInput then
+		local inputDelta = input.Delta
+		local inferredStart = input.Position - inputDelta
+		tryBeginCameraTouch(input, inferredStart)
+	end
+	if input ~= state.cameraTouchInput then
+		return
+	end
+
+	local lastPosition = state.cameraTouchLastPosition or input.Position
+	local delta = input.Position - lastPosition
 	state.cameraTouchLastPosition = input.Position
 	if not state.enabled or not state.hasBomb or not state.target then
 		return
@@ -919,7 +1284,7 @@ connect(UserInputService.TouchMoved, function(input)
 	)
 end)
 
-connect(UserInputService.TouchEnded, function(input)
+connect(UserInputService.InputEnded, function(input)
 	if input == state.cameraTouchInput then
 		state.cameraTouchInput = nil
 		state.cameraTouchLastPosition = nil
@@ -1031,4 +1396,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[AutoTrack] Carregado: 1.0 a 3.0 studs, recuo humano e camera mobile ajustavel.")
+warn("[AutoTrack] Carregado: recuo em 1.8, alvo lateral variavel e camera com flick.")
