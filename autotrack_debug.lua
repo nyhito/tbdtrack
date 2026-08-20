@@ -1,6 +1,6 @@
 -- AutoTrack Mobile
 -- Segue o bot mais proximo somente enquanto a bomba estiver com o jogador.
--- A camera permanece totalmente sob controle do jogador.
+-- Mantem movimento continuo na faixa e acompanha o alvo com camera suave.
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -20,6 +20,21 @@ local MIN_STOP_DISTANCE = 2
 local MAX_STOP_DISTANCE = 2.8
 local DISTANCE_CHANGE_INTERVAL = 1
 local MIN_DISTANCE_DELTA = 0.12
+local INNER_GUARD_DISTANCE = 2.06
+local OUTER_GUARD_DISTANCE = 2.74
+local MICRO_OFFSET_BASE = 0.16
+local MICRO_OFFSET_VARIATION = 0.055
+local MICRO_MOVE_MIN = 0.12
+local MICRO_MOVE_MAX = 0.32
+
+local CAMERA_HEIGHT = 25
+local CAMERA_BACK_DISTANCE = 9.5
+local CAMERA_FOCUS_BLEND = 0.38
+local CAMERA_FOCUS_HEIGHT = 0.9
+local CAMERA_YAW_OFFSET_DEGREES = 43
+local CAMERA_YAW_VARIATION_DEGREES = 2.4
+local CAMERA_SMOOTH_SPEED = 4.8
+local CHARACTER_TURN_SMOOTH_SPEED = 10
 local TARGET_UPDATE_INTERVAL = 0.12
 local BOMB_CHECK_INTERVAL = 0.08
 local CACHE_REFRESH_INTERVAL = 1
@@ -83,6 +98,18 @@ local state = {
 	target = nil,
 	stopDistance = RandomGenerator:NextNumber(MIN_STOP_DISTANCE, MAX_STOP_DISTANCE),
 	distanceElapsed = 0,
+	microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1,
+	microPhase = RandomGenerator:NextNumber(0, math.pi * 2),
+	microFrequency = RandomGenerator:NextNumber(0.72, 1.08),
+	cameraYawPhase = RandomGenerator:NextNumber(0, math.pi * 2),
+	cameraHeightPhase = RandomGenerator:NextNumber(0, math.pi * 2),
+	cameraBackPhase = RandomGenerator:NextNumber(0, math.pi * 2),
+	cameraActive = false,
+	controlledCamera = nil,
+	savedCameraType = nil,
+	savedCameraSubject = nil,
+	controlledHumanoid = nil,
+	savedAutoRotate = nil,
 }
 environment[GLOBAL_STATE_NAME] = state
 
@@ -386,6 +413,67 @@ local function playerHasBomb()
 		or containerHasBomb(Backpack)
 end
 
+local function restoreCharacterFacing()
+	local humanoid = state.controlledHumanoid
+	if humanoid then
+		pcall(function()
+			humanoid.AutoRotate = state.savedAutoRotate ~= false
+		end)
+	end
+
+	state.controlledHumanoid = nil
+	state.savedAutoRotate = nil
+end
+
+local function enableCharacterFacing(humanoid)
+	if state.controlledHumanoid ~= humanoid then
+		restoreCharacterFacing()
+		state.controlledHumanoid = humanoid
+		state.savedAutoRotate = humanoid.AutoRotate
+	end
+
+	humanoid.AutoRotate = false
+end
+
+local function restoreCamera()
+	if not state.cameraActive then
+		return
+	end
+
+	local camera = state.controlledCamera
+	if camera then
+		pcall(function()
+			camera.CameraType = state.savedCameraType or Enum.CameraType.Custom
+			local subject = state.savedCameraSubject
+			if subject and subject.Parent then
+				camera.CameraSubject = subject
+			else
+				local humanoid = getLocalMover()
+				if humanoid then
+					camera.CameraSubject = humanoid
+				end
+			end
+		end)
+	end
+
+	state.cameraActive = false
+	state.controlledCamera = nil
+	state.savedCameraType = nil
+	state.savedCameraSubject = nil
+end
+
+local function enableCamera(camera)
+	if state.controlledCamera ~= camera then
+		restoreCamera()
+		state.controlledCamera = camera
+		state.savedCameraType = camera.CameraType
+		state.savedCameraSubject = camera.CameraSubject
+		state.cameraActive = true
+	end
+
+	camera.CameraType = Enum.CameraType.Scriptable
+end
+
 local function releaseMovement()
 	if not state.movementLocked then
 		return
@@ -396,6 +484,12 @@ local function releaseMovement()
 	if humanoid then
 		humanoid:Move(Vector3.zero, false)
 	end
+end
+
+local function releaseTrackingControl()
+	releaseMovement()
+	restoreCharacterFacing()
+	restoreCamera()
 end
 
 local function randomizeStopDistance()
@@ -430,20 +524,72 @@ local function updateTarget()
 	state.target = getNearestBot()
 end
 
-local function movementStep()
+local function getSmoothAlpha(speed, deltaTime)
+	return 1 - math.exp(-speed * math.max(deltaTime or 0, 0))
+end
+
+local function updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
+	local offset = targetRoot.Position - localRoot.Position
+	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
+	if horizontalOffset.Magnitude <= 0.001 then
+		return
+	end
+
+	enableCharacterFacing(humanoid)
+	local desiredFacing = CFrame.lookAt(
+		localRoot.Position,
+		localRoot.Position + horizontalOffset.Unit,
+		Vector3.new(0, 1, 0)
+	)
+	local alpha = getSmoothAlpha(CHARACTER_TURN_SMOOTH_SPEED, deltaTime)
+	localRoot.CFrame = localRoot.CFrame:Lerp(desiredFacing, alpha)
+end
+
+local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+
+	local offset = targetRoot.Position - localRoot.Position
+	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
+	if horizontalOffset.Magnitude <= 0.001 then
+		return
+	end
+
+	enableCamera(camera)
+
+	local now = os.clock()
+	local towardTarget = horizontalOffset.Unit
+	local yawVariation = math.sin((now * 0.52) + state.cameraYawPhase) * CAMERA_YAW_VARIATION_DEGREES
+	local yaw = math.rad(CAMERA_YAW_OFFSET_DEGREES + yawVariation)
+	local cameraForward = CFrame.fromAxisAngle(Vector3.new(0, 1, 0), yaw):VectorToWorldSpace(towardTarget)
+
+	local height = CAMERA_HEIGHT + (math.sin((now * 0.37) + state.cameraHeightPhase) * 0.45)
+	local backDistance = CAMERA_BACK_DISTANCE + (math.sin((now * 0.29) + state.cameraBackPhase) * 0.35)
+	local focus = localRoot.Position:Lerp(targetRoot.Position, CAMERA_FOCUS_BLEND)
+		+ Vector3.new(0, CAMERA_FOCUS_HEIGHT, 0)
+	local cameraPosition = focus - (cameraForward * backDistance) + Vector3.new(0, height, 0)
+	local desiredCFrame = CFrame.lookAt(cameraPosition, focus, Vector3.new(0, 1, 0))
+	local alpha = getSmoothAlpha(CAMERA_SMOOTH_SPEED, deltaTime)
+
+	camera.CFrame = camera.CFrame:Lerp(desiredCFrame, alpha)
+end
+
+local function movementStep(deltaTime)
 	if not state.alive then
 		return
 	end
 
 	if not state.enabled or not state.hasBomb or not state.target then
-		releaseMovement()
+		releaseTrackingControl()
 		return
 	end
 
 	local humanoid, localRoot = getLocalMover()
 	local targetRoot = inspectCandidate(state.target)
 	if not humanoid or not localRoot or not targetRoot then
-		releaseMovement()
+		releaseTrackingControl()
 		return
 	end
 
@@ -452,12 +598,56 @@ local function movementStep()
 	local distance = horizontalOffset.Magnitude
 
 	state.movementLocked = true
-	if distance <= state.stopDistance or distance <= 0.001 then
-		humanoid:Move(Vector3.zero, false)
+	if distance <= 0.001 then
+		local right = localRoot.CFrame.RightVector
+		local horizontalRight = Vector3.new(right.X, 0, right.Z)
+		if horizontalRight.Magnitude > 0.001 then
+			humanoid:Move(horizontalRight.Unit * state.microSign * MICRO_MOVE_MIN, false)
+		end
 		return
 	end
 
-	humanoid:Move(horizontalOffset.Unit, false)
+	updateCharacterFacing(humanoid, localRoot, targetRoot, deltaTime)
+	updateTrackingCamera(localRoot, targetRoot, deltaTime)
+
+	local towardTarget = horizontalOffset.Unit
+	local fromTarget = -towardTarget
+	local tangent = Vector3.new(-fromTarget.Z, 0, fromTarget.X) * state.microSign
+	local now = os.clock()
+	local microOffset = MICRO_OFFSET_BASE
+		+ (math.sin((now * state.microFrequency) + state.microPhase) * MICRO_OFFSET_VARIATION)
+
+	local movementVector = nil
+	if distance > MAX_STOP_DISTANCE then
+		movementVector = towardTarget
+	elseif distance < MIN_STOP_DISTANCE then
+		local correction = (fromTarget * 0.78) + (tangent * 0.22)
+		movementVector = correction.Unit * 0.5
+	else
+		local desiredDistance = math.clamp(
+			state.stopDistance,
+			INNER_GUARD_DISTANCE,
+			OUTER_GUARD_DISTANCE
+		)
+		local desiredPosition = targetRoot.Position
+			+ (fromTarget * desiredDistance)
+			+ (tangent * microOffset)
+		local desiredOffset = desiredPosition - localRoot.Position
+		local horizontalDesiredOffset = Vector3.new(desiredOffset.X, 0, desiredOffset.Z)
+
+		if horizontalDesiredOffset.Magnitude <= 0.001 then
+			movementVector = tangent * MICRO_MOVE_MIN
+		else
+			local strength = math.clamp(
+				MICRO_MOVE_MIN + (horizontalDesiredOffset.Magnitude * 0.38),
+				MICRO_MOVE_MIN,
+				MICRO_MOVE_MAX
+			)
+			movementVector = horizontalDesiredOffset.Unit * strength
+		end
+	end
+
+	humanoid:Move(movementVector, false)
 end
 
 local function updateButtonText()
@@ -477,6 +667,12 @@ local function toggleTrack()
 	if state.enabled then
 		state.distanceElapsed = 0
 		randomizeStopDistance()
+		state.microSign = RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1
+		state.microPhase = RandomGenerator:NextNumber(0, math.pi * 2)
+		state.microFrequency = RandomGenerator:NextNumber(0.72, 1.08)
+		state.cameraYawPhase = RandomGenerator:NextNumber(0, math.pi * 2)
+		state.cameraHeightPhase = RandomGenerator:NextNumber(0, math.pi * 2)
+		state.cameraBackPhase = RandomGenerator:NextNumber(0, math.pi * 2)
 		state.hasBomb = playerHasBomb()
 		refreshCandidateCache()
 		updateTarget()
@@ -484,7 +680,7 @@ local function toggleTrack()
 		state.hasBomb = false
 		state.target = nil
 		state.distanceElapsed = 0
-		releaseMovement()
+		releaseTrackingControl()
 	end
 end
 
@@ -604,7 +800,7 @@ connect(workspace.DescendantRemoving, function(descendant)
 		state.candidates[descendant] = nil
 		if state.target == descendant then
 			state.target = nil
-			releaseMovement()
+			releaseTrackingControl()
 		end
 	end
 end)
@@ -613,7 +809,7 @@ connect(LocalPlayer.CharacterAdded, function()
 	state.hasBomb = false
 	state.target = nil
 	state.distanceElapsed = 0
-	releaseMovement()
+	releaseTrackingControl()
 end)
 
 local targetElapsed = 0
@@ -641,7 +837,7 @@ connect(RunService.Heartbeat, function(deltaTime)
 		state.hasBomb = playerHasBomb()
 		if hadBomb ~= state.hasBomb then
 			if not state.hasBomb then
-				releaseMovement()
+				releaseTrackingControl()
 			end
 		end
 	end
@@ -667,7 +863,7 @@ function state.cleanup()
 	state.hasBomb = false
 	state.target = nil
 	state.distanceElapsed = 0
-	releaseMovement()
+	releaseTrackingControl()
 
 	pcall(function()
 		RunService:UnbindFromRenderStep(MOVE_BIND_NAME)
@@ -696,4 +892,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[AutoTrack] Carregado: segue ate a distancia aleatoria de 2.0 a 2.8 studs e aguarda parado.")
+warn("[AutoTrack] Carregado: movimento continuo de 2.0 a 2.8 studs com camera diagonal suave.")
