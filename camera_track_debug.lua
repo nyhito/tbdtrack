@@ -400,8 +400,15 @@ local function inspectCandidate(model)
 end
 
 local function recordCandidateAppearance(model)
+	local appearedAt = os.clock()
+	local previousAppearance = state.candidateAppearances[model]
+	if previousAppearance
+		and appearedAt - previousAppearance.appearedAt < TARGET_UPDATE_INTERVAL then
+		return
+	end
+
 	state.candidateAppearances[model] = {
-		appearedAt = os.clock(),
+		appearedAt = appearedAt,
 		waitDuration = RandomGenerator:NextNumber(
 			BOT_APPEAR_WAIT_MIN,
 			BOT_APPEAR_WAIT_MAX
@@ -423,7 +430,8 @@ local function registerPossibleModel(instance)
 		and model:FindFirstChildOfClass("Humanoid") then
 		local wasKnown = state.candidates[model] == true
 		state.candidates[model] = true
-		if not wasKnown and state.candidateCacheInitialized then
+		if state.candidateCacheInitialized
+			and (not wasKnown or instance:IsA("Humanoid")) then
 			recordCandidateAppearance(model)
 		end
 	end
@@ -653,7 +661,7 @@ local function randomizeStopDistance()
 	state.stopDistance = nextDistance
 end
 
-local function updateTarget()
+local function updateTarget(applyAppearanceDelay)
 	if not state.enabled then
 		state.target = nil
 		state.botAppearSequenceTarget = nil
@@ -661,7 +669,11 @@ local function updateTarget()
 	end
 
 	local nextTarget = getNearestBot()
-	if nextTarget ~= state.target then
+	local appearance = nextTarget and state.candidateAppearances[nextTarget] or nil
+	local targetChanged = nextTarget ~= state.target
+	local appearedAgain = appearance ~= nil and nextTarget == state.target
+
+	if targetChanged or appearedAgain then
 		state.innerRecoveryActive = false
 		state.sharpTurnSpacingActive = false
 		state.sharpTurnSpacingElapsed = 0
@@ -673,18 +685,29 @@ local function updateTarget()
 		state.trackingActiveLastFrame = false
 		state.botAppearSequenceTarget = nil
 
-		local appearance = nextTarget and state.candidateAppearances[nextTarget] or nil
 		if appearance then
 			state.candidateAppearances[nextTarget] = nil
-			local waitUntil = appearance.appearedAt + appearance.waitDuration
-			if os.clock() < waitUntil then
-				state.botAppearSequenceTarget = nextTarget
-				state.botAppearWaitUntil = waitUntil
-				state.botAppearEngageDuration = RandomGenerator:NextNumber(
-					BOT_APPEAR_ENGAGE_DURATION_MIN,
-					BOT_APPEAR_ENGAGE_DURATION_MAX
+		end
+
+		if nextTarget and applyAppearanceDelay then
+			local currentTime = os.clock()
+			local waitUntil = appearance
+				and (appearance.appearedAt + appearance.waitDuration)
+				or currentTime
+
+			if waitUntil <= currentTime then
+				waitUntil = currentTime + RandomGenerator:NextNumber(
+					BOT_APPEAR_WAIT_MIN,
+					BOT_APPEAR_WAIT_MAX
 				)
 			end
+
+			state.botAppearSequenceTarget = nextTarget
+			state.botAppearWaitUntil = waitUntil
+			state.botAppearEngageDuration = RandomGenerator:NextNumber(
+				BOT_APPEAR_ENGAGE_DURATION_MIN,
+				BOT_APPEAR_ENGAGE_DURATION_MAX
+			)
 		end
 	end
 	state.target = nextTarget
@@ -1262,7 +1285,7 @@ local function toggleTrack()
 		state.trackingActiveLastFrame = false
 		state.hasBomb = playerHasBomb()
 		refreshCandidateCache(false)
-		updateTarget()
+		updateTarget(false)
 	else
 		state.hasBomb = false
 		state.target = nil
@@ -1446,7 +1469,7 @@ connect(RunService.Heartbeat, function(deltaTime)
 
 	if targetElapsed >= TARGET_UPDATE_INTERVAL then
 		targetElapsed = 0
-		updateTarget()
+		updateTarget(true)
 	end
 end)
 
