@@ -1,6 +1,6 @@
 -- Camera Track Mobile - variante de teste
--- Mantem temporariamente o autotrack de movimento e a faixa de studs atual.
--- A camera acompanha o bot e pode ser ajustada livremente entre 0 e 90 graus.
+-- O movimento do boneco permanece totalmente livre pelo controle nativo.
+-- A camera acompanha o bot e pode ser ajustada entre -60 e 60 graus.
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -52,8 +52,8 @@ local AIM_RETURN_CHANGE_MAX = 0.3
 local AIM_SMOOTH_SPEED = 18
 
 local TRACK_HORIZONTAL_OFFSET_DEGREES = 45
-local CAMERA_MIN_TRACK_ANGLE_DEGREES = 0
-local CAMERA_MAX_TRACK_ANGLE_DEGREES = 90
+local CAMERA_MIN_TRACK_ANGLE_DEGREES = -60
+local CAMERA_MAX_TRACK_ANGLE_DEGREES = 60
 local CAMERA_MIN_MANUAL_OFFSET_DEGREES = CAMERA_MIN_TRACK_ANGLE_DEGREES
 	- TRACK_HORIZONTAL_OFFSET_DEGREES
 local CAMERA_MAX_MANUAL_OFFSET_DEGREES = CAMERA_MAX_TRACK_ANGLE_DEGREES
@@ -1008,9 +1008,6 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 	local manualOffset = requestedOffset
 	state.cameraAppliedOffsetDegrees = manualOffset
 
-	-- Mantem a leitura das viradas bruscas usada pelo movimento temporario,
-	-- mas deixa o angulo desta variante totalmente sob controle do usuario.
-	updateCameraVariation(targetRoot, deltaTime)
 	local trackAngle = math.clamp(
 		TRACK_HORIZONTAL_OFFSET_DEGREES + manualOffset,
 		CAMERA_MIN_TRACK_ANGLE_DEGREES,
@@ -1023,7 +1020,7 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 	)
 
 	-- Reaproveita distancia, zoom e inclinacao vertical da camera normal.
-	-- Somente o angulo horizontal e recolocado dentro de 0 a 90 graus.
+	-- Somente o angulo horizontal e recolocado dentro de -60 a 60 graus.
 	local cameraOffset = camera.CFrame.Position - focus
 	local verticalOffset = cameraOffset.Y
 	local horizontalRadius = Vector3.new(cameraOffset.X, 0, cameraOffset.Z).Magnitude
@@ -1126,6 +1123,12 @@ local function movementStep(deltaTime)
 		return
 	end
 
+	-- Esta variante nunca sobrescreve Humanoid:Move nem AutoRotate. Assim, o
+	-- joystick continua 100% livre e o movimento relativo a camera permanece o
+	-- comportamento nativo do Roblox.
+	releaseMovement()
+	restoreCharacterFacing()
+
 	if not state.trackingActiveLastFrame then
 		state.trackingActiveLastFrame = true
 		state.cameraEngageActive = true
@@ -1135,140 +1138,12 @@ local function movementStep(deltaTime)
 		state.cameraEngageDuration = getCameraEngageDuration()
 	end
 
-	local offset = targetRoot.Position - localRoot.Position
-	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
-	local distance = horizontalOffset.Magnitude
-	local manualMoveDirection = humanoid.MoveDirection
-
-	state.movementLocked = true
-	if distance <= 0.001 then
-		local right = localRoot.CFrame.RightVector
-		local horizontalRight = Vector3.new(right.X, 0, right.Z)
-		if horizontalRight.Magnitude > 0.001 then
-			humanoid:Move(horizontalRight.Unit * state.microSign * MICRO_MOVE_MIN, false)
-		end
-		return
-	end
-
-	local aimPosition = updateAimPosition(targetRoot, deltaTime)
-	updateTrackingCamera(localRoot, targetRoot, aimPosition, deltaTime)
-	updateCharacterFacing(humanoid, localRoot, aimPosition, deltaTime)
-
-	local towardTarget = horizontalOffset.Unit
-	local fromTarget = -towardTarget
-	local tangent = Vector3.new(-fromTarget.Z, 0, fromTarget.X) * state.microSign
-	local aimShiftRaw = aimPosition - targetRoot.Position
-	local aimShift = Vector3.new(aimShiftRaw.X, 0, aimShiftRaw.Z)
-	local towardAimRaw = aimPosition - localRoot.Position
-	local towardAim = Vector3.new(towardAimRaw.X, 0, towardAimRaw.Z)
-	local now = os.clock()
-	local microOffset = MICRO_OFFSET_BASE
-		+ (math.sin((now * state.microFrequency) + state.microPhase) * MICRO_OFFSET_VARIATION)
-
-	local movementVector = nil
-	if state.sharpTurnSpacingActive then
-		state.sharpTurnSpacingElapsed = state.sharpTurnSpacingElapsed + deltaTime
-		local spacingError = math.abs(
-			distance - state.sharpTurnSpacingTarget
-		)
-		if state.sharpTurnSpacingElapsed >= state.sharpTurnSpacingHold
-			and spacingError <= SHARP_TURN_SETTLE_TOLERANCE then
-			state.sharpTurnSpacingSettled = state.sharpTurnSpacingSettled
-				+ deltaTime
-		else
-			state.sharpTurnSpacingSettled = 0
-		end
-
-		if state.sharpTurnSpacingSettled >= SHARP_TURN_SETTLE_TIME
-			or state.sharpTurnSpacingElapsed
-				>= state.sharpTurnSpacingMaxDuration then
-			state.sharpTurnSpacingActive = false
-			state.sharpTurnSpacingElapsed = 0
-			state.sharpTurnSpacingSettled = 0
-			randomizeStopDistance()
-		end
-	end
-
-	if not state.sharpTurnSpacingActive
-		and not state.innerRecoveryActive
-		and distance <= INNER_RECOVERY_TRIGGER_DISTANCE then
-		state.innerRecoveryActive = true
-		state.innerRecoveryTarget = RandomGenerator:NextNumber(
-			INNER_RECOVERY_TARGET_MIN,
-			INNER_RECOVERY_TARGET_MAX
-		)
-	end
-
-	if state.innerRecoveryActive then
-		if distance >= state.innerRecoveryTarget then
-			state.innerRecoveryActive = false
-			state.stopDistance = RandomGenerator:NextNumber(
-				INNER_RECOVERY_NEXT_DISTANCE_MIN,
-				INNER_RECOVERY_NEXT_DISTANCE_MAX
-			)
-			movementVector = (tangent * MICRO_MOVE_MIN)
-				+ (fromTarget * (MICRO_MOVE_MIN * 0.25))
-		else
-			local remainingDistance = state.innerRecoveryTarget - distance
-			local recoveryStrength = math.clamp(
-				INNER_RECOVERY_MOVE_MIN + (remainingDistance * 0.11),
-				INNER_RECOVERY_MOVE_MIN,
-				INNER_RECOVERY_MOVE_MAX
-			)
-			local recoveryDirection = fromTarget + (tangent * microOffset)
-			movementVector = recoveryDirection.Unit * recoveryStrength
-		end
-	elseif distance > MAX_STOP_DISTANCE then
-		movementVector = towardAim.Magnitude > 0.001
-			and towardAim.Unit
-			or towardTarget
-	elseif distance < MIN_STOP_DISTANCE then
-		local correction = fromTarget + (tangent * microOffset)
-		movementVector = correction.Unit * INNER_RECOVERY_MOVE_MAX
-	else
-		local desiredDistance = math.clamp(
-			state.sharpTurnSpacingActive
-				and state.sharpTurnSpacingTarget
-				or state.stopDistance,
-			state.sharpTurnSpacingActive
-				and SHARP_TURN_DISTANCE_MIN
-				or INNER_GUARD_DISTANCE,
-			state.sharpTurnSpacingActive
-				and SHARP_TURN_DISTANCE_MAX
-				or OUTER_GUARD_DISTANCE
-		)
-		local desiredFromCenter = (fromTarget * desiredDistance)
-			+ aimShift
-			+ (tangent * microOffset)
-		if desiredFromCenter.Magnitude > OUTER_GUARD_DISTANCE then
-			desiredFromCenter = desiredFromCenter.Unit * OUTER_GUARD_DISTANCE
-		elseif desiredFromCenter.Magnitude < INNER_GUARD_DISTANCE then
-			desiredFromCenter = desiredFromCenter.Unit * INNER_GUARD_DISTANCE
-		end
-		local desiredPosition = targetRoot.Position + desiredFromCenter
-		local desiredOffset = desiredPosition - localRoot.Position
-		local horizontalDesiredOffset = Vector3.new(desiredOffset.X, 0, desiredOffset.Z)
-
-		if horizontalDesiredOffset.Magnitude <= 0.001 then
-			movementVector = tangent * MICRO_MOVE_MIN
-		else
-			local strength = math.clamp(
-				MICRO_MOVE_MIN + (horizontalDesiredOffset.Magnitude * 0.38),
-				MICRO_MOVE_MIN,
-				MICRO_MOVE_MAX
-			)
-			movementVector = horizontalDesiredOffset.Unit * strength
-		end
-	end
-
-	movementVector = addManualMovementInfluence(
-		movementVector,
-		manualMoveDirection,
-		distance,
-		fromTarget,
-		state.innerRecoveryActive
+	updateTrackingCamera(
+		localRoot,
+		targetRoot,
+		targetRoot.Position,
+		deltaTime
 	)
-	humanoid:Move(movementVector, false)
 end
 
 local function updateButtonText()
@@ -1484,13 +1359,6 @@ connect(RunService.Heartbeat, function(deltaTime)
 	targetElapsed = targetElapsed + deltaTime
 	bombElapsed = bombElapsed + deltaTime
 	cacheElapsed = cacheElapsed + deltaTime
-	state.distanceElapsed = state.distanceElapsed + deltaTime
-
-	while state.distanceElapsed >= DISTANCE_CHANGE_INTERVAL do
-		state.distanceElapsed = state.distanceElapsed - DISTANCE_CHANGE_INTERVAL
-		randomizeStopDistance()
-	end
-
 	if bombElapsed >= BOMB_CHECK_INTERVAL then
 		bombElapsed = 0
 		local hadBomb = state.hasBomb
@@ -1552,4 +1420,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[Camera Track] Carregado: controle nativo livre e horizontal entre 0 e 90 graus.")
+warn("[Camera Track] Carregado: movimento livre, horizontal entre -60 e 60 graus e padrao em 45 graus.")
