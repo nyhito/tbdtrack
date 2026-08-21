@@ -89,8 +89,14 @@ local CAMERA_ENGAGE_FAST_DURATION_MAX = 0.1
 local CAMERA_ENGAGE_FAST_BIAS_POWER = 2.2
 local BOT_APPEAR_WAIT_MIN = 0.2
 local BOT_APPEAR_WAIT_MAX = 0.5
-local BOT_APPEAR_ENGAGE_DURATION_MIN = 0.08
-local BOT_APPEAR_ENGAGE_DURATION_MAX = 0.14
+local BOT_APPEAR_ENGAGE_DURATION_MIN = 0.1
+local BOT_APPEAR_ENGAGE_DURATION_MAX = 0.3
+local BOT_SEQUENCE_TELEPORT_MIN_DISTANCE = 3
+local BOT_SEQUENCE_TELEPORT_HARD_DISTANCE = 8
+local BOT_SEQUENCE_TELEPORT_MIN_SPEED = 65
+local BOT_SEQUENCE_DIRECTION_DOT_LIMIT = 0.2
+local BOT_SEQUENCE_NOT_FRONT_DOT_LIMIT = 0.02
+local BOT_SEQUENCE_NOT_FRONT_GRACE = 0.06
 
 local SHARP_TURN_THRESHOLD_DEGREES = 52
 local SHARP_TURN_DISTANCE_MIN = 2
@@ -185,8 +191,6 @@ local state = {
 	movementLocked = false,
 	connections = {},
 	candidates = {},
-	candidateAppearances = {},
-	candidateCacheInitialized = false,
 	target = nil,
 	stopDistance = getBiasedTrackDistance(),
 	distanceElapsed = 0,
@@ -233,6 +237,13 @@ local state = {
 	botAppearSequenceTarget = nil,
 	botAppearWaitUntil = 0,
 	botAppearEngageDuration = BOT_APPEAR_ENGAGE_DURATION_MIN,
+	botSequencePhase = "idle",
+	botSequenceRoot = nil,
+	botSequenceLastPosition = nil,
+	botSequenceLastDirection = nil,
+	botSequenceLastSampleAt = 0,
+	botSequenceNotFrontElapsed = 0,
+	botSequenceLastCameraCFrame = nil,
 	sharpTurnSpacingActive = false,
 	sharpTurnSpacingTarget = 2.5,
 	sharpTurnSpacingElapsed = 0,
@@ -399,23 +410,6 @@ local function inspectCandidate(model)
 	return getModelRoot(model, humanoid)
 end
 
-local function recordCandidateAppearance(model)
-	local appearedAt = os.clock()
-	local previousAppearance = state.candidateAppearances[model]
-	if previousAppearance
-		and appearedAt - previousAppearance.appearedAt < TARGET_UPDATE_INTERVAL then
-		return
-	end
-
-	state.candidateAppearances[model] = {
-		appearedAt = appearedAt,
-		waitDuration = RandomGenerator:NextNumber(
-			BOT_APPEAR_WAIT_MIN,
-			BOT_APPEAR_WAIT_MAX
-		),
-	}
-end
-
 local function registerPossibleModel(instance)
 	local model = nil
 
@@ -428,17 +422,11 @@ local function registerPossibleModel(instance)
 	if model
 		and model:IsDescendantOf(workspace)
 		and model:FindFirstChildOfClass("Humanoid") then
-		local wasKnown = state.candidates[model] == true
 		state.candidates[model] = true
-		if state.candidateCacheInitialized
-			and (not wasKnown or instance:IsA("Humanoid")) then
-			recordCandidateAppearance(model)
-		end
 	end
 end
 
-local function refreshCandidateCache(recordNewAppearances)
-	local previousCandidates = state.candidates
+local function refreshCandidateCache()
 	local refreshed = {}
 
 	for _, descendant in ipairs(workspace:GetDescendants()) do
@@ -450,16 +438,7 @@ local function refreshCandidateCache(recordNewAppearances)
 		end
 	end
 
-	if recordNewAppearances and state.candidateCacheInitialized then
-		for model in pairs(refreshed) do
-			if not previousCandidates[model] then
-				recordCandidateAppearance(model)
-			end
-		end
-	end
-
 	state.candidates = refreshed
-	state.candidateCacheInitialized = true
 end
 
 local function getNearestBot()
@@ -636,6 +615,58 @@ local function releaseTrackingControl()
 	state.cameraEngageStartCFrame = nil
 	state.cameraLastOutputForward = nil
 	state.trackingActiveLastFrame = false
+	state.botSequenceLastPosition = nil
+	state.botSequenceLastDirection = nil
+	state.botSequenceLastSampleAt = 0
+	state.botSequenceNotFrontElapsed = 0
+	state.botSequenceLastCameraCFrame = nil
+end
+
+local function resetBotSequenceState()
+	state.botAppearSequenceTarget = nil
+	state.botAppearWaitUntil = 0
+	state.botSequencePhase = "idle"
+	state.botSequenceRoot = nil
+	state.botSequenceLastPosition = nil
+	state.botSequenceLastDirection = nil
+	state.botSequenceLastSampleAt = 0
+	state.botSequenceNotFrontElapsed = 0
+	state.botSequenceLastCameraCFrame = nil
+end
+
+local function beginBotSequence(target, targetRoot, waitBeforeTurning)
+	local currentTime = os.clock()
+	state.botAppearSequenceTarget = target
+	state.botSequenceRoot = targetRoot
+	state.botSequenceLastPosition = targetRoot and targetRoot.Position or nil
+	state.botSequenceLastDirection = nil
+	state.botSequenceLastSampleAt = currentTime
+	state.botSequenceNotFrontElapsed = 0
+	state.botSequenceLastCameraCFrame = nil
+
+	if waitBeforeTurning then
+		state.botSequencePhase = "waiting"
+		state.botAppearWaitUntil = currentTime + RandomGenerator:NextNumber(
+			BOT_APPEAR_WAIT_MIN,
+			BOT_APPEAR_WAIT_MAX
+		)
+		state.botAppearEngageDuration = RandomGenerator:NextNumber(
+			BOT_APPEAR_ENGAGE_DURATION_MIN,
+			BOT_APPEAR_ENGAGE_DURATION_MAX
+		)
+	else
+		state.botSequencePhase = "engaging"
+		state.botAppearWaitUntil = currentTime
+		state.botAppearEngageDuration = getCameraEngageDuration()
+	end
+
+	state.cameraLastBotSamplePosition = nil
+	state.cameraLastBotMoveDirection = nil
+	state.cameraEngageActive = false
+	state.cameraEngageElapsed = 0
+	state.cameraEngageStartCFrame = nil
+	state.cameraLastOutputForward = nil
+	state.trackingActiveLastFrame = false
 end
 
 local function randomizeStopDistance()
@@ -661,19 +692,17 @@ local function randomizeStopDistance()
 	state.stopDistance = nextDistance
 end
 
-local function updateTarget(applyAppearanceDelay)
+local function updateTarget(applySequenceDelay)
 	if not state.enabled then
 		state.target = nil
-		state.botAppearSequenceTarget = nil
+		resetBotSequenceState()
 		return
 	end
 
 	local nextTarget = getNearestBot()
-	local appearance = nextTarget and state.candidateAppearances[nextTarget] or nil
 	local targetChanged = nextTarget ~= state.target
-	local appearedAgain = appearance ~= nil and nextTarget == state.target
 
-	if targetChanged or appearedAgain then
+	if targetChanged then
 		state.innerRecoveryActive = false
 		state.sharpTurnSpacingActive = false
 		state.sharpTurnSpacingElapsed = 0
@@ -683,34 +712,20 @@ local function updateTarget(applyAppearanceDelay)
 		state.cameraLastBotMoveDirection = nil
 		state.cameraLastOutputForward = nil
 		state.trackingActiveLastFrame = false
-		state.botAppearSequenceTarget = nil
+		state.target = nextTarget
 
-		if appearance then
-			state.candidateAppearances[nextTarget] = nil
-		end
-
-		if nextTarget and applyAppearanceDelay then
-			local currentTime = os.clock()
-			local waitUntil = appearance
-				and (appearance.appearedAt + appearance.waitDuration)
-				or currentTime
-
-			if waitUntil <= currentTime then
-				waitUntil = currentTime + RandomGenerator:NextNumber(
-					BOT_APPEAR_WAIT_MIN,
-					BOT_APPEAR_WAIT_MAX
-				)
-			end
-
-			state.botAppearSequenceTarget = nextTarget
-			state.botAppearWaitUntil = waitUntil
-			state.botAppearEngageDuration = RandomGenerator:NextNumber(
-				BOT_APPEAR_ENGAGE_DURATION_MIN,
-				BOT_APPEAR_ENGAGE_DURATION_MAX
+		if nextTarget then
+			beginBotSequence(
+				nextTarget,
+				inspectCandidate(nextTarget),
+				applySequenceDelay == true
 			)
+		else
+			resetBotSequenceState()
 		end
+	elseif nextTarget and state.botAppearSequenceTarget ~= nextTarget then
+		beginBotSequence(nextTarget, inspectCandidate(nextTarget), false)
 	end
-	state.target = nextTarget
 end
 
 local function getSmoothAlpha(speed, deltaTime)
@@ -1178,20 +1193,52 @@ local function addManualMovementInfluence(
 	return combinedMovement
 end
 
+local function getTargetDirection(localRoot, targetRoot)
+	return getHorizontalUnit(targetRoot.Position - localRoot.Position)
+end
+
+local function targetIsInFrontOfLastCamera(targetRoot)
+	local cameraCFrame = state.botSequenceLastCameraCFrame
+	if not cameraCFrame then
+		return true
+	end
+
+	local cameraToTarget = targetRoot.Position - cameraCFrame.Position
+	if cameraToTarget.Magnitude <= 0.001 then
+		return true
+	end
+
+	return cameraCFrame.LookVector:Dot(cameraToTarget.Unit)
+		> BOT_SEQUENCE_NOT_FRONT_DOT_LIMIT
+end
+
 local function movementStep(deltaTime)
 	if not state.alive then
 		return
 	end
 
-	if not state.enabled or not state.hasBomb or not state.target then
+	if not state.enabled or not state.hasBomb then
+		releaseTrackingControl()
+		return
+	end
+
+	if not state.target then
 		releaseTrackingControl()
 		return
 	end
 
 	local humanoid, localRoot = getLocalMover()
-	local targetRoot = inspectCandidate(state.target)
-	if not humanoid or not localRoot or not targetRoot then
+	if not humanoid or not localRoot then
 		releaseTrackingControl()
+		return
+	end
+
+	local targetRoot = inspectCandidate(state.target)
+	if not targetRoot then
+		releaseTrackingControl()
+		state.target = nil
+		resetBotSequenceState()
+		updateTarget(true)
 		return
 	end
 
@@ -1201,9 +1248,63 @@ local function movementStep(deltaTime)
 	releaseMovement()
 	restoreCharacterFacing()
 
-	local botAppearEngageDuration = nil
-	if state.botAppearSequenceTarget == state.target then
-		if os.clock() < state.botAppearWaitUntil then
+	if state.botAppearSequenceTarget ~= state.target
+		or state.botSequencePhase == "idle" then
+		beginBotSequence(state.target, targetRoot, false)
+	end
+
+	local currentTime = os.clock()
+	local currentDirection = getTargetDirection(localRoot, targetRoot)
+	local sampleElapsed = currentTime - (state.botSequenceLastSampleAt or 0)
+	local movedDistance = state.botSequenceLastPosition
+		and (targetRoot.Position - state.botSequenceLastPosition).Magnitude
+		or 0
+	local movedSpeed = sampleElapsed > 0.001
+		and (movedDistance / sampleElapsed)
+		or 0
+
+	local rootWasReplaced = state.botSequenceRoot
+		and state.botSequenceRoot ~= targetRoot
+	local positionTeleported = movedDistance >= BOT_SEQUENCE_TELEPORT_HARD_DISTANCE
+		or (
+			movedDistance >= BOT_SEQUENCE_TELEPORT_MIN_DISTANCE
+			and movedSpeed >= BOT_SEQUENCE_TELEPORT_MIN_SPEED
+		)
+	local directionChangedAbruptly = state.botSequencePhase == "tracking"
+		and state.botSequenceLastDirection
+		and currentDirection
+		and state.botSequenceLastDirection:Dot(currentDirection)
+			<= BOT_SEQUENCE_DIRECTION_DOT_LIMIT
+
+	if rootWasReplaced or positionTeleported or directionChangedAbruptly then
+		beginBotSequence(state.target, targetRoot, true)
+		return
+	end
+
+	state.botSequenceRoot = targetRoot
+	state.botSequenceLastPosition = targetRoot.Position
+	state.botSequenceLastDirection = currentDirection
+	state.botSequenceLastSampleAt = currentTime
+
+	if state.botSequencePhase == "tracking"
+		and not state.cameraEngageActive then
+		if targetIsInFrontOfLastCamera(targetRoot) then
+			state.botSequenceNotFrontElapsed = 0
+		else
+			state.botSequenceNotFrontElapsed = state.botSequenceNotFrontElapsed
+				+ deltaTime
+			if state.botSequenceNotFrontElapsed
+				>= BOT_SEQUENCE_NOT_FRONT_GRACE then
+				beginBotSequence(state.target, targetRoot, true)
+				return
+			end
+		end
+	else
+		state.botSequenceNotFrontElapsed = 0
+	end
+
+	if state.botSequencePhase == "waiting" then
+		if currentTime < state.botAppearWaitUntil then
 			state.cameraEngageActive = false
 			state.cameraEngageElapsed = 0
 			state.cameraEngageStartCFrame = nil
@@ -1212,8 +1313,8 @@ local function movementStep(deltaTime)
 			return
 		end
 
-		botAppearEngageDuration = state.botAppearEngageDuration
-		state.botAppearSequenceTarget = nil
+		state.botSequencePhase = "engaging"
+		state.trackingActiveLastFrame = false
 	end
 
 	if not state.trackingActiveLastFrame then
@@ -1222,7 +1323,8 @@ local function movementStep(deltaTime)
 		state.cameraEngageElapsed = 0
 		state.cameraEngageStartCFrame = nil
 		state.cameraLastOutputForward = nil
-		state.cameraEngageDuration = botAppearEngageDuration
+		state.cameraEngageDuration = state.botSequencePhase == "engaging"
+			and state.botAppearEngageDuration
 			or getCameraEngageDuration()
 	end
 
@@ -1232,6 +1334,20 @@ local function movementStep(deltaTime)
 		targetRoot.Position,
 		deltaTime
 	)
+
+	local camera = workspace.CurrentCamera
+	if camera then
+		state.botSequenceLastCameraCFrame = camera.CFrame
+	end
+
+	if state.botSequencePhase == "engaging"
+		and not state.cameraEngageActive then
+		state.botSequencePhase = "tracking"
+		state.botSequenceNotFrontElapsed = 0
+		state.botSequenceLastPosition = targetRoot.Position
+		state.botSequenceLastDirection = getTargetDirection(localRoot, targetRoot)
+		state.botSequenceLastSampleAt = os.clock()
+	end
 end
 
 local function updateButtonText()
@@ -1284,12 +1400,12 @@ local function toggleTrack()
 		state.cameraLastOutputForward = nil
 		state.trackingActiveLastFrame = false
 		state.hasBomb = playerHasBomb()
-		refreshCandidateCache(false)
+		refreshCandidateCache()
 		updateTarget(false)
 	else
 		state.hasBomb = false
 		state.target = nil
-		state.botAppearSequenceTarget = nil
+		resetBotSequenceState()
 		state.distanceElapsed = 0
 		releaseTrackingControl()
 	end
@@ -1422,11 +1538,15 @@ end)
 connect(workspace.DescendantRemoving, function(descendant)
 	if descendant:IsA("Model") then
 		state.candidates[descendant] = nil
-		state.candidateAppearances[descendant] = nil
 		if state.target == descendant then
 			state.target = nil
-			state.botAppearSequenceTarget = nil
+			resetBotSequenceState()
 			releaseTrackingControl()
+			task.defer(function()
+				if state.alive and state.enabled and not state.target then
+					updateTarget(true)
+				end
+			end)
 		end
 	end
 end)
@@ -1434,7 +1554,7 @@ end)
 connect(LocalPlayer.CharacterAdded, function()
 	state.hasBomb = false
 	state.target = nil
-	state.botAppearSequenceTarget = nil
+	resetBotSequenceState()
 	state.distanceElapsed = 0
 	releaseTrackingControl()
 end)
@@ -1464,7 +1584,7 @@ connect(RunService.Heartbeat, function(deltaTime)
 
 	if cacheElapsed >= CACHE_REFRESH_INTERVAL then
 		cacheElapsed = 0
-		refreshCandidateCache(true)
+		refreshCandidateCache()
 	end
 
 	if targetElapsed >= TARGET_UPDATE_INTERVAL then
@@ -1482,6 +1602,7 @@ function state.cleanup()
 	state.enabled = false
 	state.hasBomb = false
 	state.target = nil
+	resetBotSequenceState()
 	state.distanceElapsed = 0
 	releaseTrackingControl()
 
@@ -1510,6 +1631,6 @@ function state.cleanup()
 	end
 end
 
-refreshCandidateCache(false)
+refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
 warn("[Camera Track] Carregado: movimento livre, horizontal entre -60 e 60 graus e padrao em 45 graus.")
