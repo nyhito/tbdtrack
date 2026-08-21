@@ -20,16 +20,15 @@ local TARGET_UPDATE_INTERVAL = 0.10
 local BOMB_UPDATE_INTERVAL = 0.05
 local DRAG_HOLD_TIME = 0.50
 
-local TRACK_HORIZONTAL_OFFSET_DEGREES = 45
+local CAMERA_FALLBACK_ANGLE_DEGREES = 45
 local CAMERA_MIN_TRACK_ANGLE_DEGREES = -60
 local CAMERA_MAX_TRACK_ANGLE_DEGREES = 60
-local CAMERA_MIN_MANUAL_OFFSET_DEGREES = CAMERA_MIN_TRACK_ANGLE_DEGREES
-	- TRACK_HORIZONTAL_OFFSET_DEGREES
-local CAMERA_MAX_MANUAL_OFFSET_DEGREES = CAMERA_MAX_TRACK_ANGLE_DEGREES
-	- TRACK_HORIZONTAL_OFFSET_DEGREES
-local CAMERA_INPUT_NOISE_THRESHOLD_DEGREES = 0.01
-local CAMERA_INPUT_MAX_DELTA_DEGREES = 60
+local CAMERA_TOUCH_SENSITIVITY_DEGREES_PER_PIXEL = 0.075
+local CAMERA_TOUCH_MIN_X_FRACTION = 0.28
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
+local REACTION_SHARP_TURN_THRESHOLD_DEGREES = 50
+local REACTION_TRIGGER_COOLDOWN = 0.16
+local BOMB_OWNER_RESET_GAP = 1.20
 
 -- 30% keeps the former response time. 70% reacts in 0.04-0.10 s,
 -- with a bias toward the lower end of that range.
@@ -114,8 +113,13 @@ local state = {
 	teamCheckEnabled = true,
 	buttonHidden = false,
 	startTime = 10,
+	reactionTimeMs = 0,
 	connections = {},
 	target = nil,
+	transferTarget = nil,
+	bombOwner = nil,
+	observedBombInstance = nil,
+	bombMissingSince = nil,
 	bomb = nil,
 	timerLabel = nil,
 	timerLastText = nil,
@@ -125,8 +129,7 @@ local state = {
 	timerPrecise = false,
 	remainingTime = nil,
 	trackingActiveLastFrame = false,
-	cameraRequestedOffsetDegrees = 0,
-	cameraAppliedOffsetDegrees = 0,
+	cameraFreeAngleDegrees = nil,
 	cameraLastOutputForward = nil,
 	cameraEngageActive = false,
 	cameraEngageElapsed = 0,
@@ -159,6 +162,11 @@ local state = {
 	cameraFlickCooldown = 0,
 	cameraLastTargetSamplePosition = nil,
 	cameraLastTargetMoveDirection = nil,
+	cameraLastAppliedTargetDirection = nil,
+	cameraReactionUntil = 0,
+	cameraReactionCooldownUntil = 0,
+	cameraReactionHeldDirection = nil,
+	cameraPendingTurnFlick = false,
 }
 state.aimAppliedOffset = state.aimTargetOffset
 environment[GLOBAL_STATE_NAME] = state
@@ -301,6 +309,64 @@ local function findOwnedBomb()
 	return findBombIn(Backpack)
 end
 
+local function findBombHolder()
+	for _, player in ipairs(Players:GetPlayers()) do
+		local bomb = findBombIn(player.Character)
+		if not bomb then
+			local backpack = player:FindFirstChildOfClass("Backpack")
+			bomb = findBombIn(backpack)
+		end
+		if bomb then
+			return player, bomb
+		end
+	end
+
+	return nil, nil
+end
+
+local function updateBombOwnership()
+	local holder, bomb = findBombHolder()
+	local now = os.clock()
+
+	if holder then
+		state.bombMissingSince = nil
+		local isNewBomb = state.observedBombInstance ~= nil
+			and bomb ~= state.observedBombInstance
+		if not state.bombOwner or isNewBomb then
+			-- The first observed holder establishes the round baseline. This is
+			-- intentionally not treated as a pass, so spawning with the bomb
+			-- never creates an Auto Camera target.
+			state.bombOwner = holder
+			state.observedBombInstance = bomb
+			state.transferTarget = nil
+		elseif holder ~= state.bombOwner then
+			local previousHolder = state.bombOwner
+			if holder == LocalPlayer and previousHolder ~= LocalPlayer then
+				state.transferTarget = previousHolder
+			elseif previousHolder == LocalPlayer and holder ~= LocalPlayer then
+				state.transferTarget = holder
+			end
+			state.bombOwner = holder
+		end
+		state.observedBombInstance = bomb
+
+		state.bomb = holder == LocalPlayer and bomb or nil
+		return
+	end
+
+	state.bomb = nil
+	if not state.bombMissingSince then
+		state.bombMissingSince = now
+	elseif (now - state.bombMissingSince) >= BOMB_OWNER_RESET_GAP then
+		-- A short no-owner gap happens naturally during a pass. A longer gap
+		-- means the round/bomb ended, so the next holder is a fresh baseline.
+		state.bombOwner = nil
+		state.observedBombInstance = nil
+		state.transferTarget = nil
+		state.target = nil
+	end
+end
+
 local function findTimerLabel(bomb)
 	if not bomb then
 		return nil
@@ -430,28 +496,18 @@ local function playersAreTeammates(otherPlayer)
 	return false
 end
 
-local function findNearestPlayer()
-	local localRoot = getCharacterRoot(LocalPlayer.Character)
-	if not localRoot then
+local function getTransferTarget()
+	local player = state.transferTarget
+	if not player or player == LocalPlayer or player.Parent ~= Players then
+		return nil
+	end
+	if not getCharacterRoot(player.Character) then
 		return nil
 	end
 
-	local nearestPlayer = nil
-	local nearestDistance = math.huge
-	for _, player in ipairs(Players:GetPlayers()) do
-		if player ~= LocalPlayer and not playersAreTeammates(player) then
-			local root = getCharacterRoot(player.Character)
-			if root then
-				local distance = (root.Position - localRoot.Position).Magnitude
-				if distance < nearestDistance then
-					nearestDistance = distance
-					nearestPlayer = player
-				end
-			end
-		end
-	end
-
-	return nearestPlayer
+	-- Team Check remains stored in its switch, unchanged for now. Transfer
+	-- pairing takes precedence until the game's real team signal is mapped.
+	return player
 end
 
 local function randomizeAimTarget()
@@ -585,6 +641,23 @@ local function startCameraFlick(minimumAmplitude, maximumAmplitude)
 	state.cameraFlickCooldown = CAMERA_FLICK_COOLDOWN
 end
 
+local function startSharpTurnReaction()
+	local delaySeconds = math.clamp(state.reactionTimeMs or 0, 0, 99) / 1000
+	local now = os.clock()
+	if delaySeconds <= 0
+		or now < state.cameraReactionCooldownUntil
+		or not state.cameraLastAppliedTargetDirection then
+		return false
+	end
+
+	state.cameraReactionHeldDirection = state.cameraLastAppliedTargetDirection
+	state.cameraReactionUntil = now + delaySeconds
+	state.cameraReactionCooldownUntil = now
+		+ delaySeconds
+		+ REACTION_TRIGGER_COOLDOWN
+	return true
+end
+
 local function updateCameraVariation(targetRoot, deltaTime)
 	state.cameraBaseElapsed = state.cameraBaseElapsed + deltaTime
 	if state.cameraBaseElapsed >= state.cameraBaseChangeInterval then
@@ -616,13 +689,32 @@ local function updateCameraVariation(targetRoot, deltaTime)
 					1
 				)
 				local turnDegrees = math.deg(math.acos(directionDot))
+				local reactionStarted = false
+				if turnDegrees >= REACTION_SHARP_TURN_THRESHOLD_DEGREES then
+					reactionStarted = startSharpTurnReaction()
+				end
 				if turnDegrees >= CAMERA_FLICK_TURN_THRESHOLD_DEGREES
 					and state.cameraFlickCooldown <= 0 then
-					startCameraFlick(CAMERA_FLICK_TURN_MIN, CAMERA_FLICK_TURN_MAX)
+					if reactionStarted then
+						state.cameraPendingTurnFlick = true
+					else
+						startCameraFlick(
+							CAMERA_FLICK_TURN_MIN,
+							CAMERA_FLICK_TURN_MAX
+						)
+					end
 				end
 			end
 			state.cameraLastTargetMoveDirection = moveDirection
 			state.cameraLastTargetSamplePosition = targetPosition
+		end
+	end
+
+	if state.cameraPendingTurnFlick
+		and os.clock() >= state.cameraReactionUntil then
+		state.cameraPendingTurnFlick = false
+		if state.cameraFlickCooldown <= 0 then
+			startCameraFlick(CAMERA_FLICK_TURN_MIN, CAMERA_FLICK_TURN_MAX)
 		end
 	end
 
@@ -664,7 +756,7 @@ local function updateCameraVariation(targetRoot, deltaTime)
 		microOffset
 end
 
-local function resetCameraTrackingState(resetManualOffset)
+local function resetCameraTrackingState(resetFreeAngle)
 	state.trackingActiveLastFrame = false
 	state.cameraEngageActive = false
 	state.cameraEngageElapsed = 0
@@ -672,11 +764,15 @@ local function resetCameraTrackingState(resetManualOffset)
 	state.cameraLastOutputForward = nil
 	state.cameraLastTargetSamplePosition = nil
 	state.cameraLastTargetMoveDirection = nil
+	state.cameraLastAppliedTargetDirection = nil
+	state.cameraReactionUntil = 0
+	state.cameraReactionCooldownUntil = 0
+	state.cameraReactionHeldDirection = nil
+	state.cameraPendingTurnFlick = false
 	state.cameraFlickOffsetDegrees = 0
 	state.cameraFlickElapsed = state.cameraFlickDuration
-	if resetManualOffset then
-		state.cameraRequestedOffsetDegrees = 0
-		state.cameraAppliedOffsetDegrees = 0
+	if resetFreeAngle then
+		state.cameraFreeAngleDegrees = nil
 	end
 end
 
@@ -689,6 +785,10 @@ local function beginCameraTracking()
 	state.cameraLastOutputForward = nil
 	state.cameraLastTargetSamplePosition = nil
 	state.cameraLastTargetMoveDirection = nil
+	state.cameraLastAppliedTargetDirection = nil
+	state.cameraReactionUntil = 0
+	state.cameraReactionHeldDirection = nil
+	state.cameraPendingTurnFlick = false
 	state.cameraMicroPhaseA = RandomGenerator:NextNumber(0, math.pi * 2)
 	state.cameraMicroPhaseB = RandomGenerator:NextNumber(0, math.pi * 2)
 	randomizeAimTarget()
@@ -702,53 +802,48 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	end
 
 	local aimPosition = updateAimPosition(targetRoot, deltaTime)
-	local horizontalOffset = getHorizontalUnit(aimPosition - localRoot.Position)
-	if not horizontalOffset then
+	local rawTargetDirection = getHorizontalUnit(aimPosition - localRoot.Position)
+	if not rawTargetDirection then
 		return
 	end
 
 	local focus = camera.Focus.Position
-	local defaultForward = getHorizontalUnit(focus - camera.CFrame.Position)
-	if state.cameraLastOutputForward and defaultForward then
-		local inputDeltaDegrees = getSignedHorizontalAngle(
-			state.cameraLastOutputForward,
-			defaultForward
-		)
-		if math.abs(inputDeltaDegrees) >= CAMERA_INPUT_NOISE_THRESHOLD_DEGREES then
-			inputDeltaDegrees = math.clamp(
-				inputDeltaDegrees,
-				-CAMERA_INPUT_MAX_DELTA_DEGREES,
-				CAMERA_INPUT_MAX_DELTA_DEGREES
+	if state.cameraFreeAngleDegrees == nil then
+		local currentForward = getHorizontalUnit(focus - camera.CFrame.Position)
+		if currentForward then
+			state.cameraFreeAngleDegrees = math.clamp(
+				getSignedHorizontalAngle(rawTargetDirection, currentForward),
+				CAMERA_MIN_TRACK_ANGLE_DEGREES,
+				CAMERA_MAX_TRACK_ANGLE_DEGREES
 			)
-			state.cameraRequestedOffsetDegrees = math.clamp(
-				(state.cameraRequestedOffsetDegrees or 0) + inputDeltaDegrees,
-				CAMERA_MIN_MANUAL_OFFSET_DEGREES,
-				CAMERA_MAX_MANUAL_OFFSET_DEGREES
-			)
+		else
+			state.cameraFreeAngleDegrees = CAMERA_FALLBACK_ANGLE_DEGREES
 		end
 	end
-
-	local manualOffset = math.clamp(
-		state.cameraRequestedOffsetDegrees or 0,
-		CAMERA_MIN_MANUAL_OFFSET_DEGREES,
-		CAMERA_MAX_MANUAL_OFFSET_DEGREES
-	)
-	state.cameraAppliedOffsetDegrees = manualOffset
 
 	local baseError, flickError, microError = updateCameraVariation(
 		targetRoot,
 		deltaTime
 	)
+
+	local targetDirection = rawTargetDirection
+	if os.clock() < state.cameraReactionUntil
+		and state.cameraReactionHeldDirection then
+		targetDirection = state.cameraReactionHeldDirection
+	else
+		state.cameraReactionHeldDirection = nil
+		state.cameraLastAppliedTargetDirection = rawTargetDirection
+	end
+
 	local trackAngle = math.clamp(
-		TRACK_HORIZONTAL_OFFSET_DEGREES
-			+ manualOffset
+		(state.cameraFreeAngleDegrees or CAMERA_FALLBACK_ANGLE_DEGREES)
 			+ baseError
 			+ flickError
 			+ microError,
 		CAMERA_MIN_TRACK_ANGLE_DEGREES,
 		CAMERA_MAX_TRACK_ANGLE_DEGREES
 	)
-	local limitedForward = rotateHorizontalLeft(horizontalOffset, trackAngle)
+	local limitedForward = rotateHorizontalLeft(targetDirection, trackAngle)
 
 	-- Keep the native zoom and vertical pitch. Only the horizontal direction
 	-- is guided, so the player can still move the camera vertically and zoom.
@@ -814,6 +909,7 @@ local function addTrueRoundedShadow(parent, cornerRadius, strength, shadowColor)
 		shadow.Size = UDim2.new(1, config.grow, 1, config.grow)
 		shadow.BackgroundColor3 = shadowColor
 		shadow.BackgroundTransparency = config.transparency
+		shadow:SetAttribute("ShownTransparency", config.transparency)
 		shadow.BorderSizePixel = 0
 		shadow.ZIndex = math.max(parent.ZIndex - 1, 0)
 		shadow.Active = false
@@ -847,7 +943,7 @@ local MobileButton = Instance.new("TextButton")
 MobileButton.Name = "AutoCameraButton"
 MobileButton.Size = UDim2.new(0, 140, 0, 50)
 MobileButton.Position = UDim2.new(0, 150, 0, initialY)
-MobileButton.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+MobileButton.BackgroundColor3 = Color3.fromRGB(180, 38, 45)
 MobileButton.BorderSizePixel = 0
 MobileButton.Text = "Auto Camera Off"
 MobileButton.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -1099,11 +1195,51 @@ StartTimeBox.Parent = timeRow
 Instance.new("UICorner", StartTimeBox).CornerRadius = UDim.new(0, 10)
 noTextStroke(StartTimeBox)
 
+local reactionRow = Instance.new("Frame")
+reactionRow.Size = UDim2.new(1, -14, 0, 48)
+reactionRow.Position = UDim2.new(0, 7, 0, 84)
+reactionRow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+reactionRow.BorderSizePixel = 0
+reactionRow.ZIndex = 35
+reactionRow.Parent = MobileSettingsPage
+Instance.new("UICorner", reactionRow).CornerRadius = UDim.new(0, 12)
+
+local reactionLabel = Instance.new("TextLabel")
+reactionLabel.Size = UDim2.new(1, -86, 1, 0)
+reactionLabel.Position = UDim2.new(0, 12, 0, 0)
+reactionLabel.BackgroundTransparency = 1
+reactionLabel.Text = "Reaction Time"
+reactionLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+reactionLabel.Font = Enum.Font.GothamBold
+reactionLabel.TextSize = 15
+reactionLabel.TextXAlignment = Enum.TextXAlignment.Left
+reactionLabel.ZIndex = 36
+reactionLabel.Parent = reactionRow
+noTextStroke(reactionLabel)
+
+local ReactionTimeBox = Instance.new("TextBox")
+ReactionTimeBox.Name = "ReactionTime"
+ReactionTimeBox.Size = UDim2.new(0, 64, 0, 30)
+ReactionTimeBox.Position = UDim2.new(1, -74, 0.5, -15)
+ReactionTimeBox.BackgroundColor3 = Color3.fromRGB(20, 20, 24)
+ReactionTimeBox.BorderSizePixel = 0
+ReactionTimeBox.Text = "0ms"
+ReactionTimeBox.PlaceholderText = "0"
+ReactionTimeBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+ReactionTimeBox.PlaceholderColor3 = Color3.fromRGB(100, 100, 100)
+ReactionTimeBox.Font = Enum.Font.GothamBold
+ReactionTimeBox.TextSize = 14
+ReactionTimeBox.ClearTextOnFocus = false
+ReactionTimeBox.ZIndex = 37
+ReactionTimeBox.Parent = reactionRow
+Instance.new("UICorner", ReactionTimeBox).CornerRadius = UDim.new(0, 10)
+noTextStroke(ReactionTimeBox)
+
 local settingsNote = Instance.new("TextLabel")
 settingsNote.Size = UDim2.new(1, -24, 0, 36)
-settingsNote.Position = UDim2.new(0, 12, 0, 84)
+settingsNote.Position = UDim2.new(0, 12, 0, 142)
 settingsNote.BackgroundTransparency = 1
-settingsNote.Text = "0-10 seconds • decimals supported"
+settingsNote.Text = "Start: 0-10s • Reaction: 0-99ms"
 settingsNote.TextColor3 = Color3.fromRGB(95, 95, 95)
 settingsNote.Font = Enum.Font.Gotham
 settingsNote.TextSize = 11
@@ -1258,6 +1394,7 @@ local function bindFreeDrag(handle, target, holdTime, onMoved)
 		if not holdSatisfied then
 			if delta.Magnitude >= 10 then
 				holdCanceled = true
+				handle:SetAttribute("LastDragTime", os.clock())
 			end
 			return
 		end
@@ -1311,6 +1448,36 @@ local function bindPressAnimation(button, scaleObject)
 	end)
 end
 
+local function setMainButtonVisualHidden(hidden, instant)
+	state.buttonHidden = hidden
+	-- Keep the GuiButton alive and Active. Only its pixels disappear, so the
+	-- exact same area still accepts taps and the 0.5 s drag gesture.
+	MobileButton.Visible = true
+	local duration = instant and 0 or 0.16
+	TweenService:Create(
+		MobileButton,
+		TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{
+			BackgroundTransparency = hidden and 1 or 0,
+			TextTransparency = hidden and 1 or 0,
+		}
+	):Play()
+
+	for _, descendant in ipairs(MobileButton:GetDescendants()) do
+		if descendant.Name == "TrueShadow" and descendant:IsA("Frame") then
+			local shownTransparency = descendant:GetAttribute("ShownTransparency")
+			if type(shownTransparency) ~= "number" then
+				shownTransparency = 0.9
+			end
+			TweenService:Create(
+				descendant,
+				TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+				{BackgroundTransparency = hidden and 1 or shownTransparency}
+			):Play()
+		end
+	end
+end
+
 local function updateButtonText()
 	MobileButton.Text = state.enabled and "Auto Camera On" or "Auto Camera Off"
 	TweenService:Create(
@@ -1318,8 +1485,8 @@ local function updateButtonText()
 		TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
 		{
 			BackgroundColor3 = state.enabled
-				and Color3.fromRGB(9, 9, 9)
-				or Color3.fromRGB(0, 0, 0),
+				and Color3.fromRGB(34, 177, 76)
+				or Color3.fromRGB(180, 38, 45),
 		}
 	):Play()
 end
@@ -1329,8 +1496,9 @@ local function toggleAutoCamera()
 	updateButtonText()
 	resetCameraTrackingState(true)
 	if state.enabled then
+		updateBombOwnership()
 		updateRemainingTime()
-		state.target = findNearestPlayer()
+		state.target = getTransferTarget()
 		showNotice("Auto Camera enabled")
 	else
 		state.target = nil
@@ -1434,6 +1602,27 @@ local function applyStartTimeText()
 	showNotice("Start time: " .. StartTimeBox.Text)
 end
 
+local function applyReactionTimeText()
+	local normalized = tostring(ReactionTimeBox.Text or "")
+		:gsub(",", ".")
+	local numericText = normalized:match("%-?%d+%.?%d*")
+	local value = numericText and tonumber(numericText) or nil
+	if value == nil then
+		ReactionTimeBox.Text = tostring(state.reactionTimeMs) .. "ms"
+		showNotice("Use a value from 0 to 99ms")
+		return
+	end
+
+	state.reactionTimeMs = math.floor(math.clamp(value, 0, 99) + 0.5)
+	ReactionTimeBox.Text = tostring(state.reactionTimeMs) .. "ms"
+	if state.reactionTimeMs == 0 then
+		state.cameraReactionUntil = 0
+		state.cameraReactionHeldDirection = nil
+		state.cameraPendingTurnFlick = false
+	end
+	showNotice("Reaction time: " .. ReactionTimeBox.Text)
+end
+
 updateSwitchVisual(hideButtonSwitch, hideButtonKnob, state.buttonHidden, true)
 updateSwitchVisual(teamCheckSwitch, teamCheckKnob, state.teamCheckEnabled, true)
 
@@ -1466,8 +1655,8 @@ connect(MobileTabSettings.Activated, function()
 end)
 
 connect(HideButtonRow.Activated, function()
-	state.buttonHidden = not state.buttonHidden
-	MobileButton.Visible = not state.buttonHidden
+	local nextHidden = not state.buttonHidden
+	setMainButtonVisualHidden(nextHidden, false)
 	updateSwitchVisual(hideButtonSwitch, hideButtonKnob, state.buttonHidden, false)
 	showNotice(state.buttonHidden and "Button hidden" or "Button shown")
 end)
@@ -1484,6 +1673,73 @@ connect(StartTimeBox.FocusLost, function()
 	applyStartTimeText()
 end)
 
+connect(ReactionTimeBox.FocusLost, function()
+	applyReactionTimeText()
+end)
+
+local activeCameraTouch = nil
+local lastCameraTouchPosition = nil
+
+local function touchHitsCerberGui(position)
+	local hit = false
+	pcall(function()
+		for _, object in ipairs(GuiService:GetGuiObjectsAtPosition(
+			position.X,
+			position.Y
+		)) do
+			if object:IsDescendantOf(ScreenGui) then
+				hit = true
+				break
+			end
+		end
+	end)
+	return hit
+end
+
+connect(UserInputService.InputBegan, function(input, gameProcessed)
+	if input.UserInputType ~= Enum.UserInputType.Touch
+		or gameProcessed
+		or activeCameraTouch
+		or not state.trackingActiveLastFrame then
+		return
+	end
+
+	local camera = workspace.CurrentCamera
+	if not camera
+		or input.Position.X
+			< (camera.ViewportSize.X * CAMERA_TOUCH_MIN_X_FRACTION)
+		or touchHitsCerberGui(input.Position) then
+		return
+	end
+
+	activeCameraTouch = input
+	lastCameraTouchPosition = input.Position
+end)
+
+connect(UserInputService.InputChanged, function(input)
+	if input ~= activeCameraTouch or not lastCameraTouchPosition then
+		return
+	end
+
+	local delta = input.Position - lastCameraTouchPosition
+	lastCameraTouchPosition = input.Position
+	if state.cameraFreeAngleDegrees ~= nil and math.abs(delta.X) >= 0.05 then
+		state.cameraFreeAngleDegrees = math.clamp(
+			state.cameraFreeAngleDegrees
+				+ (delta.X * CAMERA_TOUCH_SENSITIVITY_DEGREES_PER_PIXEL),
+			CAMERA_MIN_TRACK_ANGLE_DEGREES,
+			CAMERA_MAX_TRACK_ANGLE_DEGREES
+		)
+	end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+	if input == activeCameraTouch then
+		activeCameraTouch = nil
+		lastCameraTouchPosition = nil
+	end
+end)
+
 local bombAccumulator = BOMB_UPDATE_INTERVAL
 local targetAccumulator = TARGET_UPDATE_INTERVAL
 
@@ -1495,6 +1751,7 @@ connect(RunService.Heartbeat, function(deltaTime)
 	bombAccumulator = bombAccumulator + deltaTime
 	if bombAccumulator >= BOMB_UPDATE_INTERVAL then
 		bombAccumulator = bombAccumulator % BOMB_UPDATE_INTERVAL
+		updateBombOwnership()
 		updateRemainingTime()
 	end
 
@@ -1503,7 +1760,7 @@ connect(RunService.Heartbeat, function(deltaTime)
 		targetAccumulator = targetAccumulator % TARGET_UPDATE_INTERVAL
 		local nextTarget = nil
 		if state.enabled and state.bomb then
-			nextTarget = findNearestPlayer()
+			nextTarget = getTransferTarget()
 		end
 		if nextTarget ~= state.target then
 			state.target = nextTarget
@@ -1547,13 +1804,20 @@ RunService:BindToRenderStep(
 )
 
 connect(LocalPlayer.CharacterAdded, function()
+	state.bombOwner = nil
+	state.observedBombInstance = nil
+	state.bombMissingSince = nil
+	state.transferTarget = nil
 	resetTimerState(nil, nil)
 	state.target = nil
 	resetCameraTrackingState(true)
 end)
 
 connect(Players.PlayerRemoving, function(player)
-	if player == state.target then
+	if player == state.target or player == state.transferTarget then
+		if player == state.transferTarget then
+			state.transferTarget = nil
+		end
 		state.target = nil
 		resetCameraTrackingState(false)
 	end
@@ -1592,6 +1856,8 @@ state.cleanup = function()
 end
 
 updateButtonText()
+setMainButtonVisualHidden(state.buttonHidden, true)
+updateBombOwnership()
 updateRemainingTime()
-state.target = findNearestPlayer()
+state.target = getTransferTarget()
 print("[Cerber W Auto Camera] loaded")
