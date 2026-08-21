@@ -20,15 +20,11 @@ local TARGET_UPDATE_INTERVAL = 0.10
 local BOMB_UPDATE_INTERVAL = 0.05
 local DRAG_HOLD_TIME = 0.50
 
-local TRACK_HORIZONTAL_OFFSET_DEGREES = 45
+local CAMERA_FALLBACK_ANGLE_DEGREES = 0
 local CAMERA_MIN_TRACK_ANGLE_DEGREES = -60
 local CAMERA_MAX_TRACK_ANGLE_DEGREES = 60
-local CAMERA_MIN_MANUAL_OFFSET_DEGREES = CAMERA_MIN_TRACK_ANGLE_DEGREES
-	- TRACK_HORIZONTAL_OFFSET_DEGREES
-local CAMERA_MAX_MANUAL_OFFSET_DEGREES = CAMERA_MAX_TRACK_ANGLE_DEGREES
-	- TRACK_HORIZONTAL_OFFSET_DEGREES
 local CAMERA_INPUT_NOISE_THRESHOLD_DEGREES = 0.06
-local CAMERA_INPUT_MAX_DELTA_DEGREES = 14
+local CAMERA_INPUT_MAX_DELTA_DEGREES = 25
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
 local TARGET_SWITCH_ADVANTAGE_STUDS = 0.75
 local REACTION_SHARP_TURN_THRESHOLD_DEGREES = 50
@@ -129,8 +125,7 @@ local state = {
 	timerPrecise = false,
 	remainingTime = nil,
 	trackingActiveLastFrame = false,
-	cameraRequestedOffsetDegrees = 0,
-	cameraAppliedOffsetDegrees = 0,
+	cameraFreeAngleDegrees = nil,
 	cameraLastOutputForward = nil,
 	cameraEngageActive = false,
 	cameraEngageElapsed = 0,
@@ -725,7 +720,7 @@ local function updateCameraVariation(targetRoot, deltaTime)
 		microOffset
 end
 
-local function resetCameraTrackingState(resetManualOffset)
+local function resetCameraTrackingState(resetFreeAngle)
 	state.trackingActiveLastFrame = false
 	state.cameraEngageActive = false
 	state.cameraEngageElapsed = 0
@@ -740,9 +735,8 @@ local function resetCameraTrackingState(resetManualOffset)
 	state.cameraPendingTurnFlick = false
 	state.cameraFlickOffsetDegrees = 0
 	state.cameraFlickElapsed = state.cameraFlickDuration
-	if resetManualOffset then
-		state.cameraRequestedOffsetDegrees = 0
-		state.cameraAppliedOffsetDegrees = 0
+	if resetFreeAngle then
+		state.cameraFreeAngleDegrees = nil
 	end
 end
 
@@ -779,6 +773,18 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 
 	local focus = camera.Focus.Position
 	local defaultForward = getHorizontalUnit(focus - camera.CFrame.Position)
+	if state.cameraFreeAngleDegrees == nil then
+		if defaultForward then
+			state.cameraFreeAngleDegrees = math.clamp(
+				getSignedHorizontalAngle(rawTargetDirection, defaultForward),
+				CAMERA_MIN_TRACK_ANGLE_DEGREES,
+				CAMERA_MAX_TRACK_ANGLE_DEGREES
+			)
+		else
+			state.cameraFreeAngleDegrees = CAMERA_FALLBACK_ANGLE_DEGREES
+		end
+	end
+
 	if not state.cameraEngageActive
 		and state.cameraLastOutputForward
 		and defaultForward then
@@ -796,20 +802,14 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 				-CAMERA_INPUT_MAX_DELTA_DEGREES,
 				CAMERA_INPUT_MAX_DELTA_DEGREES
 			)
-			state.cameraRequestedOffsetDegrees = math.clamp(
-				(state.cameraRequestedOffsetDegrees or 0) + inputDeltaDegrees,
-				CAMERA_MIN_MANUAL_OFFSET_DEGREES,
-				CAMERA_MAX_MANUAL_OFFSET_DEGREES
+			state.cameraFreeAngleDegrees = math.clamp(
+				(state.cameraFreeAngleDegrees or CAMERA_FALLBACK_ANGLE_DEGREES)
+					+ inputDeltaDegrees,
+				CAMERA_MIN_TRACK_ANGLE_DEGREES,
+				CAMERA_MAX_TRACK_ANGLE_DEGREES
 			)
 		end
 	end
-
-	local manualOffset = math.clamp(
-		state.cameraRequestedOffsetDegrees or 0,
-		CAMERA_MIN_MANUAL_OFFSET_DEGREES,
-		CAMERA_MAX_MANUAL_OFFSET_DEGREES
-	)
-	state.cameraAppliedOffsetDegrees = manualOffset
 
 	local baseError, flickError, microError = updateCameraVariation(
 		targetRoot,
@@ -826,8 +826,7 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	end
 
 	local trackAngle = math.clamp(
-		TRACK_HORIZONTAL_OFFSET_DEGREES
-			+ manualOffset
+		(state.cameraFreeAngleDegrees or CAMERA_FALLBACK_ANGLE_DEGREES)
 			+ baseError
 			+ flickError
 			+ microError,
