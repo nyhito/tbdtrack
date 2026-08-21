@@ -58,9 +58,9 @@ local CAMERA_MIN_MANUAL_OFFSET_DEGREES = CAMERA_MIN_TRACK_ANGLE_DEGREES
 	- TRACK_HORIZONTAL_OFFSET_DEGREES
 local CAMERA_MAX_MANUAL_OFFSET_DEGREES = CAMERA_MAX_TRACK_ANGLE_DEGREES
 	- TRACK_HORIZONTAL_OFFSET_DEGREES
-local CAMERA_TOUCH_SENSITIVITY = 0.075
-local CAMERA_TOUCH_REGION_START = 0.3
-local CAMERA_MANUAL_SMOOTH_SPEED = 14
+local CAMERA_MANUAL_SMOOTH_SPEED = 24
+local CAMERA_INPUT_NOISE_THRESHOLD_DEGREES = 0.02
+local CAMERA_INPUT_MAX_DELTA_DEGREES = 28
 local CAMERA_BASE_ERROR_LIMIT_DEGREES = 5
 local CAMERA_BASE_MIN_ABSOLUTE_DEGREES = 0.35
 local CAMERA_BASE_CHANGE_MIN = 0.38
@@ -224,8 +224,7 @@ local state = {
 	cameraEngageDuration = CAMERA_ENGAGE_DURATION_MIN,
 	cameraEngageStartCFrame = nil,
 	trackingActiveLastFrame = false,
-	cameraTouchInput = nil,
-	cameraTouchLastPosition = nil,
+	cameraLastOutputForward = nil,
 	sharpTurnSpacingActive = false,
 	sharpTurnSpacingTarget = 2.5,
 	sharpTurnSpacingElapsed = 0,
@@ -595,6 +594,7 @@ local function releaseTrackingControl()
 	state.cameraEngageActive = false
 	state.cameraEngageElapsed = 0
 	state.cameraEngageStartCFrame = nil
+	state.cameraLastOutputForward = nil
 	state.trackingActiveLastFrame = false
 end
 
@@ -636,6 +636,7 @@ local function updateTarget()
 		state.aimElapsed = state.aimChangeInterval
 		state.cameraLastBotSamplePosition = nil
 		state.cameraLastBotMoveDirection = nil
+		state.cameraLastOutputForward = nil
 		state.trackingActiveLastFrame = false
 	end
 	state.target = nextTarget
@@ -655,6 +656,26 @@ local function rotateHorizontalLeft(direction, degrees)
 		Vector3.new(0, 1, 0),
 		math.rad(degrees)
 	):VectorToWorldSpace(direction)
+end
+
+local function getHorizontalUnit(direction)
+	local horizontal = Vector3.new(direction.X, 0, direction.Z)
+	if horizontal.Magnitude <= 0.001 then
+		return nil
+	end
+	return horizontal.Unit
+end
+
+local function getSignedHorizontalAngle(fromDirection, toDirection)
+	local fromHorizontal = getHorizontalUnit(fromDirection)
+	local toHorizontal = getHorizontalUnit(toDirection)
+	if not fromHorizontal or not toHorizontal then
+		return 0
+	end
+
+	local dot = math.clamp(fromHorizontal:Dot(toHorizontal), -1, 1)
+	local crossY = fromHorizontal:Cross(toHorizontal).Y
+	return math.deg(math.atan2(crossY, dot))
 end
 
 local function getDirectionSign(value)
@@ -964,6 +985,32 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 	end
 
 	local towardTarget = horizontalOffset.Unit
+
+	-- A CameraModule do Roblox roda antes deste passo. Comparamos a direcao que
+	-- ela produziu com a nossa ultima saida para recuperar o arraste horizontal
+	-- real, sem depender dos eventos TouchMoved/InputChanged do executor.
+	local focus = camera.Focus.Position
+	local defaultForward = getHorizontalUnit(focus - camera.CFrame.Position)
+	if state.cameraLastOutputForward and defaultForward then
+		local inputDeltaDegrees = getSignedHorizontalAngle(
+			state.cameraLastOutputForward,
+			defaultForward
+		)
+		if math.abs(inputDeltaDegrees)
+			>= CAMERA_INPUT_NOISE_THRESHOLD_DEGREES then
+			inputDeltaDegrees = math.clamp(
+				inputDeltaDegrees,
+				-CAMERA_INPUT_MAX_DELTA_DEGREES,
+				CAMERA_INPUT_MAX_DELTA_DEGREES
+			)
+			state.cameraRequestedOffsetDegrees = math.clamp(
+				(state.cameraRequestedOffsetDegrees or 0) + inputDeltaDegrees,
+				CAMERA_MIN_MANUAL_OFFSET_DEGREES,
+				CAMERA_MAX_MANUAL_OFFSET_DEGREES
+			)
+		end
+	end
+
 	local requestedOffset = math.clamp(
 		state.cameraRequestedOffsetDegrees or 0,
 		CAMERA_MIN_MANUAL_OFFSET_DEGREES,
@@ -988,9 +1035,8 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 		trackAngle
 	)
 
-	-- Usa a distancia, o zoom e a inclinacao vertical produzidos pela camera
-	-- normal. Apenas o eixo horizontal fica limitado entre 10 e 60 graus.
-	local focus = camera.Focus.Position
+	-- Reaproveita distancia, zoom e inclinacao vertical da camera normal.
+	-- Somente o angulo horizontal e recolocado dentro de 10 a 60 graus.
 	local cameraOffset = camera.CFrame.Position - focus
 	local verticalOffset = cameraOffset.Y
 	local horizontalRadius = Vector3.new(cameraOffset.X, 0, cameraOffset.Z).Magnitude
@@ -1025,6 +1071,10 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 	else
 		camera.CFrame = desiredCameraCFrame
 	end
+
+	state.cameraLastOutputForward = getHorizontalUnit(
+		focus - camera.CFrame.Position
+	)
 end
 
 local function addManualMovementInfluence(
@@ -1094,6 +1144,7 @@ local function movementStep(deltaTime)
 		state.cameraEngageActive = true
 		state.cameraEngageElapsed = 0
 		state.cameraEngageStartCFrame = nil
+		state.cameraLastOutputForward = nil
 		state.cameraEngageDuration = getCameraEngageDuration()
 	end
 
@@ -1280,9 +1331,8 @@ local function toggleTrack()
 		state.cameraEngageActive = false
 		state.cameraEngageElapsed = 0
 		state.cameraEngageStartCFrame = nil
+		state.cameraLastOutputForward = nil
 		state.trackingActiveLastFrame = false
-		state.cameraTouchInput = nil
-		state.cameraTouchLastPosition = nil
 		state.hasBomb = playerHasBomb()
 		refreshCandidateCache()
 		updateTarget()
@@ -1410,76 +1460,6 @@ connect(UserInputService.InputEnded, function(input)
 	end
 end)
 
-local function isPointInsideTrackButton(position)
-	local buttonPosition = MobileButton.AbsolutePosition
-	local buttonSize = MobileButton.AbsoluteSize
-	return position.X >= buttonPosition.X
-		and position.X <= buttonPosition.X + buttonSize.X
-		and position.Y >= buttonPosition.Y
-		and position.Y <= buttonPosition.Y + buttonSize.Y
-end
-
-local function tryBeginCameraTouch(input, initialPosition)
-	if input.UserInputType ~= Enum.UserInputType.Touch
-		or state.cameraTouchInput
-		or not state.enabled
-		or input == activeInput
-		or isPointInsideTrackButton(initialPosition) then
-		return false
-	end
-
-	local camera = workspace.CurrentCamera
-	if not camera
-		or initialPosition.X < (camera.ViewportSize.X * CAMERA_TOUCH_REGION_START) then
-		return false
-	end
-
-	state.cameraTouchInput = input
-	state.cameraTouchLastPosition = initialPosition
-	return true
-end
-
--- Captura o toque pelos eventos gerais para nao depender da camera padrao do
--- jogo ou do sinal TouchMoved do executor.
-connect(UserInputService.InputBegan, function(input)
-	tryBeginCameraTouch(input, input.Position)
-end)
-
-connect(UserInputService.InputChanged, function(input)
-	if input.UserInputType ~= Enum.UserInputType.Touch then
-		return
-	end
-
-	if not state.cameraTouchInput then
-		local inputDelta = input.Delta
-		local inferredStart = input.Position - inputDelta
-		tryBeginCameraTouch(input, inferredStart)
-	end
-	if input ~= state.cameraTouchInput then
-		return
-	end
-
-	local lastPosition = state.cameraTouchLastPosition or input.Position
-	local delta = input.Position - lastPosition
-	state.cameraTouchLastPosition = input.Position
-	if not state.enabled or not state.hasBomb or not state.target then
-		return
-	end
-
-	state.cameraRequestedOffsetDegrees = math.clamp(
-		state.cameraRequestedOffsetDegrees - (delta.X * CAMERA_TOUCH_SENSITIVITY),
-		CAMERA_MIN_MANUAL_OFFSET_DEGREES,
-		CAMERA_MAX_MANUAL_OFFSET_DEGREES
-	)
-end)
-
-connect(UserInputService.InputEnded, function(input)
-	if input == state.cameraTouchInput then
-		state.cameraTouchInput = nil
-		state.cameraTouchLastPosition = nil
-	end
-end)
-
 connect(workspace.DescendantAdded, function(descendant)
 	if descendant:IsA("Model")
 		or descendant:IsA("Humanoid")
@@ -1585,4 +1565,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[Camera Track] Carregado: angulo livre entre 10 e 60 graus, padrao em 45.")
+warn("[Camera Track] Carregado: controle nativo completo e horizontal entre 10 e 60 graus.")
