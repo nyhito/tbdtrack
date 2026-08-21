@@ -91,12 +91,15 @@ local BOT_APPEAR_WAIT_MIN = 0.2
 local BOT_APPEAR_WAIT_MAX = 0.5
 local BOT_APPEAR_ENGAGE_DURATION_MIN = 0.1
 local BOT_APPEAR_ENGAGE_DURATION_MAX = 0.3
-local BOT_SEQUENCE_TELEPORT_MIN_DISTANCE = 3
-local BOT_SEQUENCE_TELEPORT_HARD_DISTANCE = 8
-local BOT_SEQUENCE_TELEPORT_MIN_SPEED = 65
-local BOT_SEQUENCE_DIRECTION_DOT_LIMIT = 0.2
-local BOT_SEQUENCE_NOT_FRONT_DOT_LIMIT = 0.02
-local BOT_SEQUENCE_NOT_FRONT_GRACE = 0.06
+local BOT_SEQUENCE_MOTION_EPSILON = 0.01
+local BOT_SEQUENCE_TELEPORT_MIN_DISTANCE = 0.65
+local BOT_SEQUENCE_TELEPORT_MIN_RESIDUAL = 0.45
+local BOT_SEQUENCE_TELEPORT_HARD_DISTANCE = 2.4
+local BOT_SEQUENCE_TELEPORT_HARD_SPEED = 25
+local BOT_SEQUENCE_PHYSICS_VELOCITY_SPIKE = 90
+local BOT_SEQUENCE_MAX_SAMPLE_INTERVAL = 0.25
+local BOT_SEQUENCE_VELOCITY_BLEND = 0.55
+local BOT_SEQUENCE_VELOCITY_DECAY = 3
 
 local SHARP_TURN_THRESHOLD_DEGREES = 52
 local SHARP_TURN_DISTANCE_MIN = 2
@@ -240,10 +243,9 @@ local state = {
 	botSequencePhase = "idle",
 	botSequenceRoot = nil,
 	botSequenceLastPosition = nil,
-	botSequenceLastDirection = nil,
 	botSequenceLastSampleAt = 0,
-	botSequenceNotFrontElapsed = 0,
-	botSequenceLastCameraCFrame = nil,
+	botSequenceEstimatedVelocity = Vector3.zero,
+	botSequenceLastPhysicsVelocity = Vector3.zero,
 	sharpTurnSpacingActive = false,
 	sharpTurnSpacingTarget = 2.5,
 	sharpTurnSpacingElapsed = 0,
@@ -615,11 +617,6 @@ local function releaseTrackingControl()
 	state.cameraEngageStartCFrame = nil
 	state.cameraLastOutputForward = nil
 	state.trackingActiveLastFrame = false
-	state.botSequenceLastPosition = nil
-	state.botSequenceLastDirection = nil
-	state.botSequenceLastSampleAt = 0
-	state.botSequenceNotFrontElapsed = 0
-	state.botSequenceLastCameraCFrame = nil
 end
 
 local function resetBotSequenceState()
@@ -628,10 +625,9 @@ local function resetBotSequenceState()
 	state.botSequencePhase = "idle"
 	state.botSequenceRoot = nil
 	state.botSequenceLastPosition = nil
-	state.botSequenceLastDirection = nil
 	state.botSequenceLastSampleAt = 0
-	state.botSequenceNotFrontElapsed = 0
-	state.botSequenceLastCameraCFrame = nil
+	state.botSequenceEstimatedVelocity = Vector3.zero
+	state.botSequenceLastPhysicsVelocity = Vector3.zero
 end
 
 local function beginBotSequence(target, targetRoot, waitBeforeTurning)
@@ -639,10 +635,11 @@ local function beginBotSequence(target, targetRoot, waitBeforeTurning)
 	state.botAppearSequenceTarget = target
 	state.botSequenceRoot = targetRoot
 	state.botSequenceLastPosition = targetRoot and targetRoot.Position or nil
-	state.botSequenceLastDirection = nil
 	state.botSequenceLastSampleAt = currentTime
-	state.botSequenceNotFrontElapsed = 0
-	state.botSequenceLastCameraCFrame = nil
+	state.botSequenceEstimatedVelocity = targetRoot
+		and targetRoot.AssemblyLinearVelocity
+		or Vector3.zero
+	state.botSequenceLastPhysicsVelocity = state.botSequenceEstimatedVelocity
 
 	if waitBeforeTurning then
 		state.botSequencePhase = "waiting"
@@ -1193,23 +1190,89 @@ local function addManualMovementInfluence(
 	return combinedMovement
 end
 
-local function getTargetDirection(localRoot, targetRoot)
-	return getHorizontalUnit(targetRoot.Position - localRoot.Position)
-end
-
-local function targetIsInFrontOfLastCamera(targetRoot)
-	local cameraCFrame = state.botSequenceLastCameraCFrame
-	if not cameraCFrame then
+local function targetTeleported(targetRoot, currentTime, deltaTime)
+	if state.botSequenceRoot and state.botSequenceRoot ~= targetRoot then
 		return true
 	end
 
-	local cameraToTarget = targetRoot.Position - cameraCFrame.Position
-	if cameraToTarget.Magnitude <= 0.001 then
+	local currentPosition = targetRoot.Position
+	local currentPhysicsVelocity = targetRoot.AssemblyLinearVelocity
+	if not state.botSequenceLastPosition then
+		state.botSequenceRoot = targetRoot
+		state.botSequenceLastPosition = currentPosition
+		state.botSequenceLastSampleAt = currentTime
+		state.botSequenceEstimatedVelocity = currentPhysicsVelocity
+		state.botSequenceLastPhysicsVelocity = currentPhysicsVelocity
+		return false
+	end
+
+	local positionDelta = currentPosition - state.botSequenceLastPosition
+	local movedDistance = positionDelta.Magnitude
+	if movedDistance <= BOT_SEQUENCE_MOTION_EPSILON then
+		local decay = math.exp(
+			-BOT_SEQUENCE_VELOCITY_DECAY * math.max(deltaTime or 0, 0)
+		)
+		state.botSequenceEstimatedVelocity = state.botSequenceEstimatedVelocity
+			* decay
+		state.botSequenceLastPhysicsVelocity = currentPhysicsVelocity
+		return false
+	end
+
+	local sampleInterval = math.clamp(
+		currentTime - (state.botSequenceLastSampleAt or currentTime),
+		1 / 240,
+		BOT_SEQUENCE_MAX_SAMPLE_INTERVAL
+	)
+	local previousPhysicsVelocity = state.botSequenceLastPhysicsVelocity
+		or Vector3.zero
+	local estimatedVelocity = state.botSequenceEstimatedVelocity
+		or Vector3.zero
+	local physicsPrediction = (
+		previousPhysicsVelocity + currentPhysicsVelocity
+	) * 0.5 * sampleInterval
+	local learnedPrediction = estimatedVelocity * sampleInterval
+	local physicsResidual = (positionDelta - physicsPrediction).Magnitude
+	local learnedResidual = (positionDelta - learnedPrediction).Magnitude
+	local bestResidual = math.min(physicsResidual, learnedResidual)
+
+	local targetHumanoid = state.target
+		and state.target:FindFirstChildOfClass("Humanoid")
+	local walkingAllowance = 0
+	if targetHumanoid and targetHumanoid.MoveDirection.Magnitude > 0.05 then
+		walkingAllowance = targetHumanoid.WalkSpeed * sampleInterval * 1.4
+	end
+
+	local hardDistance = math.max(
+		BOT_SEQUENCE_TELEPORT_HARD_DISTANCE,
+		BOT_SEQUENCE_TELEPORT_HARD_SPEED * sampleInterval
+	)
+	local physicsVelocitySpike = currentPhysicsVelocity.Magnitude
+		>= BOT_SEQUENCE_PHYSICS_VELOCITY_SPIKE
+		or previousPhysicsVelocity.Magnitude
+			>= BOT_SEQUENCE_PHYSICS_VELOCITY_SPIKE
+	local residualTeleport = movedDistance
+		>= BOT_SEQUENCE_TELEPORT_MIN_DISTANCE
+		and bestResidual >= BOT_SEQUENCE_TELEPORT_MIN_RESIDUAL
+		and movedDistance > walkingAllowance + 0.35
+	local teleported = movedDistance >= hardDistance
+		or (movedDistance >= BOT_SEQUENCE_TELEPORT_MIN_DISTANCE
+			and physicsVelocitySpike)
+		or residualTeleport
+
+	if teleported then
 		return true
 	end
 
-	return cameraCFrame.LookVector:Dot(cameraToTarget.Unit)
-		> BOT_SEQUENCE_NOT_FRONT_DOT_LIMIT
+	local observedVelocity = positionDelta / sampleInterval
+	state.botSequenceEstimatedVelocity = estimatedVelocity:Lerp(
+		observedVelocity,
+		BOT_SEQUENCE_VELOCITY_BLEND
+	)
+	state.botSequenceRoot = targetRoot
+	state.botSequenceLastPosition = currentPosition
+	state.botSequenceLastSampleAt = currentTime
+	state.botSequenceLastPhysicsVelocity = currentPhysicsVelocity
+	return false
 end
 
 local function movementStep(deltaTime)
@@ -1217,7 +1280,7 @@ local function movementStep(deltaTime)
 		return
 	end
 
-	if not state.enabled or not state.hasBomb then
+	if not state.enabled then
 		releaseTrackingControl()
 		return
 	end
@@ -1254,53 +1317,14 @@ local function movementStep(deltaTime)
 	end
 
 	local currentTime = os.clock()
-	local currentDirection = getTargetDirection(localRoot, targetRoot)
-	local sampleElapsed = currentTime - (state.botSequenceLastSampleAt or 0)
-	local movedDistance = state.botSequenceLastPosition
-		and (targetRoot.Position - state.botSequenceLastPosition).Magnitude
-		or 0
-	local movedSpeed = sampleElapsed > 0.001
-		and (movedDistance / sampleElapsed)
-		or 0
-
-	local rootWasReplaced = state.botSequenceRoot
-		and state.botSequenceRoot ~= targetRoot
-	local positionTeleported = movedDistance >= BOT_SEQUENCE_TELEPORT_HARD_DISTANCE
-		or (
-			movedDistance >= BOT_SEQUENCE_TELEPORT_MIN_DISTANCE
-			and movedSpeed >= BOT_SEQUENCE_TELEPORT_MIN_SPEED
-		)
-	local directionChangedAbruptly = state.botSequencePhase == "tracking"
-		and state.botSequenceLastDirection
-		and currentDirection
-		and state.botSequenceLastDirection:Dot(currentDirection)
-			<= BOT_SEQUENCE_DIRECTION_DOT_LIMIT
-
-	if rootWasReplaced or positionTeleported or directionChangedAbruptly then
+	if targetTeleported(targetRoot, currentTime, deltaTime) then
 		beginBotSequence(state.target, targetRoot, true)
 		return
 	end
 
-	state.botSequenceRoot = targetRoot
-	state.botSequenceLastPosition = targetRoot.Position
-	state.botSequenceLastDirection = currentDirection
-	state.botSequenceLastSampleAt = currentTime
-
-	if state.botSequencePhase == "tracking"
-		and not state.cameraEngageActive then
-		if targetIsInFrontOfLastCamera(targetRoot) then
-			state.botSequenceNotFrontElapsed = 0
-		else
-			state.botSequenceNotFrontElapsed = state.botSequenceNotFrontElapsed
-				+ deltaTime
-			if state.botSequenceNotFrontElapsed
-				>= BOT_SEQUENCE_NOT_FRONT_GRACE then
-				beginBotSequence(state.target, targetRoot, true)
-				return
-			end
-		end
-	else
-		state.botSequenceNotFrontElapsed = 0
+	if not state.hasBomb then
+		releaseTrackingControl()
+		return
 	end
 
 	if state.botSequencePhase == "waiting" then
@@ -1335,18 +1359,13 @@ local function movementStep(deltaTime)
 		deltaTime
 	)
 
-	local camera = workspace.CurrentCamera
-	if camera then
-		state.botSequenceLastCameraCFrame = camera.CFrame
-	end
-
 	if state.botSequencePhase == "engaging"
 		and not state.cameraEngageActive then
 		state.botSequencePhase = "tracking"
-		state.botSequenceNotFrontElapsed = 0
 		state.botSequenceLastPosition = targetRoot.Position
-		state.botSequenceLastDirection = getTargetDirection(localRoot, targetRoot)
 		state.botSequenceLastSampleAt = os.clock()
+		state.botSequenceEstimatedVelocity = targetRoot.AssemblyLinearVelocity
+		state.botSequenceLastPhysicsVelocity = targetRoot.AssemblyLinearVelocity
 	end
 end
 
