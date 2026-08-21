@@ -1,6 +1,6 @@
 -- Camera Track Mobile - variante de teste
 -- Mantem temporariamente o autotrack de movimento e a faixa de studs atual.
--- A camera acompanha o bot e pode ser ajustada livremente entre 10 e 60 graus.
+-- A camera acompanha o bot e pode ser ajustada livremente entre 0 e 90 graus.
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -52,15 +52,14 @@ local AIM_RETURN_CHANGE_MAX = 0.3
 local AIM_SMOOTH_SPEED = 18
 
 local TRACK_HORIZONTAL_OFFSET_DEGREES = 45
-local CAMERA_MIN_TRACK_ANGLE_DEGREES = 10
-local CAMERA_MAX_TRACK_ANGLE_DEGREES = 60
+local CAMERA_MIN_TRACK_ANGLE_DEGREES = 0
+local CAMERA_MAX_TRACK_ANGLE_DEGREES = 90
 local CAMERA_MIN_MANUAL_OFFSET_DEGREES = CAMERA_MIN_TRACK_ANGLE_DEGREES
 	- TRACK_HORIZONTAL_OFFSET_DEGREES
 local CAMERA_MAX_MANUAL_OFFSET_DEGREES = CAMERA_MAX_TRACK_ANGLE_DEGREES
 	- TRACK_HORIZONTAL_OFFSET_DEGREES
-local CAMERA_MANUAL_SMOOTH_SPEED = 24
-local CAMERA_INPUT_NOISE_THRESHOLD_DEGREES = 0.02
-local CAMERA_INPUT_MAX_DELTA_DEGREES = 28
+local CAMERA_INPUT_NOISE_THRESHOLD_DEGREES = 0.01
+local CAMERA_INPUT_MAX_DELTA_DEGREES = 60
 local CAMERA_BASE_ERROR_LIMIT_DEGREES = 5
 local CAMERA_BASE_MIN_ABSOLUTE_DEGREES = 0.35
 local CAMERA_BASE_CHANGE_MIN = 0.38
@@ -947,23 +946,11 @@ local function updateCharacterFacing(humanoid, localRoot, aimPosition, deltaTime
 	end
 
 	enableCharacterFacing(humanoid)
-	local cameraOffset = math.clamp(
-		state.cameraAppliedOffsetDegrees or 0,
-		CAMERA_MIN_MANUAL_OFFSET_DEGREES,
-		CAMERA_MAX_MANUAL_OFFSET_DEGREES
-	)
-	local characterAngle = math.clamp(
-		TRACK_HORIZONTAL_OFFSET_DEGREES + cameraOffset,
-		CAMERA_MIN_TRACK_ANGLE_DEGREES,
-		CAMERA_MAX_TRACK_ANGLE_DEGREES
-	)
-	local angledForward = rotateHorizontalLeft(
-		horizontalOffset.Unit,
-		characterAngle
-	)
+	-- O boneco continua seguindo o bot, mas nao gira junto com o angulo manual
+	-- da camera. Isso evita realimentacao e deixa o arraste mais natural.
 	local desiredFacing = CFrame.lookAt(
 		localRoot.Position,
-		localRoot.Position + angledForward,
+		localRoot.Position + horizontalOffset.Unit,
 		Vector3.new(0, 1, 0)
 	)
 	local alpha = getSmoothAlpha(CHARACTER_TURN_SMOOTH_SPEED, deltaTime)
@@ -1016,9 +1003,9 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 		CAMERA_MIN_MANUAL_OFFSET_DEGREES,
 		CAMERA_MAX_MANUAL_OFFSET_DEGREES
 	)
-	local currentOffset = state.cameraAppliedOffsetDegrees or 0
-	local alpha = getSmoothAlpha(CAMERA_MANUAL_SMOOTH_SPEED, deltaTime)
-	local manualOffset = currentOffset + ((requestedOffset - currentOffset) * alpha)
+	-- A CameraModule ja suaviza o movimento do dedo. Aplicar outro filtro aqui
+	-- criava atraso; usar o valor diretamente deixa a resposta praticamente 1:1.
+	local manualOffset = requestedOffset
 	state.cameraAppliedOffsetDegrees = manualOffset
 
 	-- Mantem a leitura das viradas bruscas usada pelo movimento temporario,
@@ -1036,7 +1023,7 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 	)
 
 	-- Reaproveita distancia, zoom e inclinacao vertical da camera normal.
-	-- Somente o angulo horizontal e recolocado dentro de 10 a 60 graus.
+	-- Somente o angulo horizontal e recolocado dentro de 0 a 90 graus.
 	local cameraOffset = camera.CFrame.Position - focus
 	local verticalOffset = cameraOffset.Y
 	local horizontalRadius = Vector3.new(cameraOffset.X, 0, cameraOffset.Z).Magnitude
@@ -1565,4 +1552,4 @@ end
 
 refreshCandidateCache()
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
-warn("[Camera Track] Carregado: controle nativo completo e horizontal entre 10 e 60 graus.")
+warn("[Camera Track] Carregado: controle nativo livre e horizontal entre 0 e 90 graus.")
