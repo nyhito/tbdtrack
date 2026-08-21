@@ -87,6 +87,10 @@ local CAMERA_ENGAGE_SLOW_CHANCE = 0.3
 local CAMERA_ENGAGE_FAST_DURATION_MIN = 0.04
 local CAMERA_ENGAGE_FAST_DURATION_MAX = 0.1
 local CAMERA_ENGAGE_FAST_BIAS_POWER = 2.2
+local BOT_APPEAR_WAIT_MIN = 0.2
+local BOT_APPEAR_WAIT_MAX = 0.5
+local BOT_APPEAR_ENGAGE_DURATION_MIN = 0.08
+local BOT_APPEAR_ENGAGE_DURATION_MAX = 0.14
 
 local SHARP_TURN_THRESHOLD_DEGREES = 52
 local SHARP_TURN_DISTANCE_MIN = 2
@@ -181,6 +185,8 @@ local state = {
 	movementLocked = false,
 	connections = {},
 	candidates = {},
+	candidateAppearances = {},
+	candidateCacheInitialized = false,
 	target = nil,
 	stopDistance = getBiasedTrackDistance(),
 	distanceElapsed = 0,
@@ -224,6 +230,9 @@ local state = {
 	cameraEngageStartCFrame = nil,
 	trackingActiveLastFrame = false,
 	cameraLastOutputForward = nil,
+	botAppearSequenceTarget = nil,
+	botAppearWaitUntil = 0,
+	botAppearEngageDuration = BOT_APPEAR_ENGAGE_DURATION_MIN,
 	sharpTurnSpacingActive = false,
 	sharpTurnSpacingTarget = 2.5,
 	sharpTurnSpacingElapsed = 0,
@@ -390,6 +399,16 @@ local function inspectCandidate(model)
 	return getModelRoot(model, humanoid)
 end
 
+local function recordCandidateAppearance(model)
+	state.candidateAppearances[model] = {
+		appearedAt = os.clock(),
+		waitDuration = RandomGenerator:NextNumber(
+			BOT_APPEAR_WAIT_MIN,
+			BOT_APPEAR_WAIT_MAX
+		),
+	}
+end
+
 local function registerPossibleModel(instance)
 	local model = nil
 
@@ -402,11 +421,16 @@ local function registerPossibleModel(instance)
 	if model
 		and model:IsDescendantOf(workspace)
 		and model:FindFirstChildOfClass("Humanoid") then
+		local wasKnown = state.candidates[model] == true
 		state.candidates[model] = true
+		if not wasKnown and state.candidateCacheInitialized then
+			recordCandidateAppearance(model)
+		end
 	end
 end
 
-local function refreshCandidateCache()
+local function refreshCandidateCache(recordNewAppearances)
+	local previousCandidates = state.candidates
 	local refreshed = {}
 
 	for _, descendant in ipairs(workspace:GetDescendants()) do
@@ -418,7 +442,16 @@ local function refreshCandidateCache()
 		end
 	end
 
+	if recordNewAppearances and state.candidateCacheInitialized then
+		for model in pairs(refreshed) do
+			if not previousCandidates[model] then
+				recordCandidateAppearance(model)
+			end
+		end
+	end
+
 	state.candidates = refreshed
+	state.candidateCacheInitialized = true
 end
 
 local function getNearestBot()
@@ -623,6 +656,7 @@ end
 local function updateTarget()
 	if not state.enabled then
 		state.target = nil
+		state.botAppearSequenceTarget = nil
 		return
 	end
 
@@ -637,6 +671,21 @@ local function updateTarget()
 		state.cameraLastBotMoveDirection = nil
 		state.cameraLastOutputForward = nil
 		state.trackingActiveLastFrame = false
+		state.botAppearSequenceTarget = nil
+
+		local appearance = nextTarget and state.candidateAppearances[nextTarget] or nil
+		if appearance then
+			state.candidateAppearances[nextTarget] = nil
+			local waitUntil = appearance.appearedAt + appearance.waitDuration
+			if os.clock() < waitUntil then
+				state.botAppearSequenceTarget = nextTarget
+				state.botAppearWaitUntil = waitUntil
+				state.botAppearEngageDuration = RandomGenerator:NextNumber(
+					BOT_APPEAR_ENGAGE_DURATION_MIN,
+					BOT_APPEAR_ENGAGE_DURATION_MAX
+				)
+			end
+		end
 	end
 	state.target = nextTarget
 end
@@ -1129,13 +1178,29 @@ local function movementStep(deltaTime)
 	releaseMovement()
 	restoreCharacterFacing()
 
+	local botAppearEngageDuration = nil
+	if state.botAppearSequenceTarget == state.target then
+		if os.clock() < state.botAppearWaitUntil then
+			state.cameraEngageActive = false
+			state.cameraEngageElapsed = 0
+			state.cameraEngageStartCFrame = nil
+			state.cameraLastOutputForward = nil
+			state.trackingActiveLastFrame = false
+			return
+		end
+
+		botAppearEngageDuration = state.botAppearEngageDuration
+		state.botAppearSequenceTarget = nil
+	end
+
 	if not state.trackingActiveLastFrame then
 		state.trackingActiveLastFrame = true
 		state.cameraEngageActive = true
 		state.cameraEngageElapsed = 0
 		state.cameraEngageStartCFrame = nil
 		state.cameraLastOutputForward = nil
-		state.cameraEngageDuration = getCameraEngageDuration()
+		state.cameraEngageDuration = botAppearEngageDuration
+			or getCameraEngageDuration()
 	end
 
 	updateTrackingCamera(
@@ -1196,11 +1261,12 @@ local function toggleTrack()
 		state.cameraLastOutputForward = nil
 		state.trackingActiveLastFrame = false
 		state.hasBomb = playerHasBomb()
-		refreshCandidateCache()
+		refreshCandidateCache(false)
 		updateTarget()
 	else
 		state.hasBomb = false
 		state.target = nil
+		state.botAppearSequenceTarget = nil
 		state.distanceElapsed = 0
 		releaseTrackingControl()
 	end
@@ -1333,8 +1399,10 @@ end)
 connect(workspace.DescendantRemoving, function(descendant)
 	if descendant:IsA("Model") then
 		state.candidates[descendant] = nil
+		state.candidateAppearances[descendant] = nil
 		if state.target == descendant then
 			state.target = nil
+			state.botAppearSequenceTarget = nil
 			releaseTrackingControl()
 		end
 	end
@@ -1343,6 +1411,7 @@ end)
 connect(LocalPlayer.CharacterAdded, function()
 	state.hasBomb = false
 	state.target = nil
+	state.botAppearSequenceTarget = nil
 	state.distanceElapsed = 0
 	releaseTrackingControl()
 end)
@@ -1372,7 +1441,7 @@ connect(RunService.Heartbeat, function(deltaTime)
 
 	if cacheElapsed >= CACHE_REFRESH_INTERVAL then
 		cacheElapsed = 0
-		refreshCandidateCache()
+		refreshCandidateCache(true)
 	end
 
 	if targetElapsed >= TARGET_UPDATE_INTERVAL then
@@ -1418,6 +1487,6 @@ function state.cleanup()
 	end
 end
 
-refreshCandidateCache()
+refreshCandidateCache(false)
 RunService:BindToRenderStep(MOVE_BIND_NAME, Enum.RenderPriority.Last.Value, movementStep)
 warn("[Camera Track] Carregado: movimento livre, horizontal entre -60 e 60 graus e padrao em 45 graus.")
