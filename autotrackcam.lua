@@ -20,12 +20,17 @@ local TARGET_UPDATE_INTERVAL = 0.10
 local BOMB_UPDATE_INTERVAL = 0.05
 local DRAG_HOLD_TIME = 0.50
 
-local CAMERA_FALLBACK_ANGLE_DEGREES = 45
+local TRACK_HORIZONTAL_OFFSET_DEGREES = 45
 local CAMERA_MIN_TRACK_ANGLE_DEGREES = -60
 local CAMERA_MAX_TRACK_ANGLE_DEGREES = 60
-local CAMERA_TOUCH_SENSITIVITY_DEGREES_PER_PIXEL = 0.075
-local CAMERA_TOUCH_MIN_X_FRACTION = 0.28
+local CAMERA_MIN_MANUAL_OFFSET_DEGREES = CAMERA_MIN_TRACK_ANGLE_DEGREES
+	- TRACK_HORIZONTAL_OFFSET_DEGREES
+local CAMERA_MAX_MANUAL_OFFSET_DEGREES = CAMERA_MAX_TRACK_ANGLE_DEGREES
+	- TRACK_HORIZONTAL_OFFSET_DEGREES
+local CAMERA_INPUT_NOISE_THRESHOLD_DEGREES = 0.06
+local CAMERA_INPUT_MAX_DELTA_DEGREES = 14
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
+local TARGET_SWITCH_ADVANTAGE_STUDS = 0.75
 local REACTION_SHARP_TURN_THRESHOLD_DEGREES = 50
 local REACTION_TRIGGER_COOLDOWN = 0.16
 
@@ -124,7 +129,8 @@ local state = {
 	timerPrecise = false,
 	remainingTime = nil,
 	trackingActiveLastFrame = false,
-	cameraFreeAngleDegrees = nil,
+	cameraRequestedOffsetDegrees = 0,
+	cameraAppliedOffsetDegrees = 0,
 	cameraLastOutputForward = nil,
 	cameraEngageActive = false,
 	cameraEngageElapsed = 0,
@@ -433,7 +439,7 @@ local function playersAreTeammates(otherPlayer)
 	return false
 end
 
-local function findNearestPlayer()
+local function findNearestPlayer(currentTarget)
 	local localRoot = getCharacterRoot(LocalPlayer.Character)
 	if not localRoot then
 		return nil
@@ -441,17 +447,31 @@ local function findNearestPlayer()
 
 	local nearestPlayer = nil
 	local nearestDistance = math.huge
+	local currentDistance = math.huge
 	for _, player in ipairs(Players:GetPlayers()) do
 		if player ~= LocalPlayer then
 			local root = getCharacterRoot(player.Character)
 			if root then
 				local distance = (root.Position - localRoot.Position).Magnitude
+				if player == currentTarget then
+					currentDistance = distance
+				end
 				if distance < nearestDistance then
 					nearestDistance = distance
 					nearestPlayer = player
 				end
 			end
 		end
+	end
+
+	-- Do not alternate every 0.1 s when two players are almost tied. The new
+	-- player must be at least slightly closer before ownership of the camera
+	-- changes; an invalid/dead current target still switches immediately.
+	if currentTarget
+		and currentDistance < math.huge
+		and nearestPlayer ~= currentTarget
+		and (nearestDistance + TARGET_SWITCH_ADVANTAGE_STUDS) >= currentDistance then
+		return currentTarget
 	end
 
 	-- Team Check remains outside target selection until its game-specific
@@ -705,7 +725,7 @@ local function updateCameraVariation(targetRoot, deltaTime)
 		microOffset
 end
 
-local function resetCameraTrackingState(resetFreeAngle)
+local function resetCameraTrackingState(resetManualOffset)
 	state.trackingActiveLastFrame = false
 	state.cameraEngageActive = false
 	state.cameraEngageElapsed = 0
@@ -720,8 +740,9 @@ local function resetCameraTrackingState(resetFreeAngle)
 	state.cameraPendingTurnFlick = false
 	state.cameraFlickOffsetDegrees = 0
 	state.cameraFlickElapsed = state.cameraFlickDuration
-	if resetFreeAngle then
-		state.cameraFreeAngleDegrees = nil
+	if resetManualOffset then
+		state.cameraRequestedOffsetDegrees = 0
+		state.cameraAppliedOffsetDegrees = 0
 	end
 end
 
@@ -757,18 +778,38 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	end
 
 	local focus = camera.Focus.Position
-	if state.cameraFreeAngleDegrees == nil then
-		local currentForward = getHorizontalUnit(focus - camera.CFrame.Position)
-		if currentForward then
-			state.cameraFreeAngleDegrees = math.clamp(
-				getSignedHorizontalAngle(rawTargetDirection, currentForward),
-				CAMERA_MIN_TRACK_ANGLE_DEGREES,
-				CAMERA_MAX_TRACK_ANGLE_DEGREES
+	local defaultForward = getHorizontalUnit(focus - camera.CFrame.Position)
+	if not state.cameraEngageActive
+		and state.cameraLastOutputForward
+		and defaultForward then
+		-- CameraModule runs before this render step. Its difference from our
+		-- previous output is the real native horizontal drag. Tiny differences
+		-- are engine noise; very large one-frame differences are camera spikes.
+		local inputDeltaDegrees = getSignedHorizontalAngle(
+			state.cameraLastOutputForward,
+			defaultForward
+		)
+		if math.abs(inputDeltaDegrees)
+			>= CAMERA_INPUT_NOISE_THRESHOLD_DEGREES then
+			inputDeltaDegrees = math.clamp(
+				inputDeltaDegrees,
+				-CAMERA_INPUT_MAX_DELTA_DEGREES,
+				CAMERA_INPUT_MAX_DELTA_DEGREES
 			)
-		else
-			state.cameraFreeAngleDegrees = CAMERA_FALLBACK_ANGLE_DEGREES
+			state.cameraRequestedOffsetDegrees = math.clamp(
+				(state.cameraRequestedOffsetDegrees or 0) + inputDeltaDegrees,
+				CAMERA_MIN_MANUAL_OFFSET_DEGREES,
+				CAMERA_MAX_MANUAL_OFFSET_DEGREES
+			)
 		end
 	end
+
+	local manualOffset = math.clamp(
+		state.cameraRequestedOffsetDegrees or 0,
+		CAMERA_MIN_MANUAL_OFFSET_DEGREES,
+		CAMERA_MAX_MANUAL_OFFSET_DEGREES
+	)
+	state.cameraAppliedOffsetDegrees = manualOffset
 
 	local baseError, flickError, microError = updateCameraVariation(
 		targetRoot,
@@ -785,7 +826,8 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	end
 
 	local trackAngle = math.clamp(
-		(state.cameraFreeAngleDegrees or CAMERA_FALLBACK_ANGLE_DEGREES)
+		TRACK_HORIZONTAL_OFFSET_DEGREES
+			+ manualOffset
 			+ baseError
 			+ flickError
 			+ microError,
@@ -1446,7 +1488,7 @@ local function toggleAutoCamera()
 	resetCameraTrackingState(true)
 	if state.enabled then
 		updateRemainingTime()
-		state.target = findNearestPlayer()
+		state.target = findNearestPlayer(state.target)
 		showNotice("Auto Camera enabled")
 	else
 		state.target = nil
@@ -1625,69 +1667,6 @@ connect(ReactionTimeBox.FocusLost, function()
 	applyReactionTimeText()
 end)
 
-local activeCameraTouch = nil
-local lastCameraTouchPosition = nil
-
-local function touchHitsCerberGui(position)
-	local hit = false
-	pcall(function()
-		for _, object in ipairs(GuiService:GetGuiObjectsAtPosition(
-			position.X,
-			position.Y
-		)) do
-			if object:IsDescendantOf(ScreenGui) then
-				hit = true
-				break
-			end
-		end
-	end)
-	return hit
-end
-
-connect(UserInputService.InputBegan, function(input, gameProcessed)
-	if input.UserInputType ~= Enum.UserInputType.Touch
-		or gameProcessed
-		or activeCameraTouch
-		or not state.trackingActiveLastFrame then
-		return
-	end
-
-	local camera = workspace.CurrentCamera
-	if not camera
-		or input.Position.X
-			< (camera.ViewportSize.X * CAMERA_TOUCH_MIN_X_FRACTION)
-		or touchHitsCerberGui(input.Position) then
-		return
-	end
-
-	activeCameraTouch = input
-	lastCameraTouchPosition = input.Position
-end)
-
-connect(UserInputService.InputChanged, function(input)
-	if input ~= activeCameraTouch or not lastCameraTouchPosition then
-		return
-	end
-
-	local delta = input.Position - lastCameraTouchPosition
-	lastCameraTouchPosition = input.Position
-	if state.cameraFreeAngleDegrees ~= nil and math.abs(delta.X) >= 0.05 then
-		state.cameraFreeAngleDegrees = math.clamp(
-			state.cameraFreeAngleDegrees
-				+ (delta.X * CAMERA_TOUCH_SENSITIVITY_DEGREES_PER_PIXEL),
-			CAMERA_MIN_TRACK_ANGLE_DEGREES,
-			CAMERA_MAX_TRACK_ANGLE_DEGREES
-		)
-	end
-end)
-
-connect(UserInputService.InputEnded, function(input)
-	if input == activeCameraTouch then
-		activeCameraTouch = nil
-		lastCameraTouchPosition = nil
-	end
-end)
-
 local bombAccumulator = BOMB_UPDATE_INTERVAL
 local targetAccumulator = TARGET_UPDATE_INTERVAL
 
@@ -1707,7 +1686,7 @@ connect(RunService.Heartbeat, function(deltaTime)
 		targetAccumulator = targetAccumulator % TARGET_UPDATE_INTERVAL
 		local nextTarget = nil
 		if state.enabled and state.bomb then
-			nextTarget = findNearestPlayer()
+			nextTarget = findNearestPlayer(state.target)
 		end
 		if nextTarget ~= state.target then
 			state.target = nextTarget
@@ -1798,5 +1777,5 @@ end
 updateButtonText()
 setMainButtonVisualHidden(state.buttonHidden, true)
 updateRemainingTime()
-state.target = findNearestPlayer()
+state.target = findNearestPlayer(state.target)
 print("[Cerber W Auto Camera] loaded")
