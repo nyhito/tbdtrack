@@ -1,4 +1,4 @@
--- Cerber W - Auto Camera Mobile
+-- AutoTrackCam - Cerber W Mobile
 -- Camera-only tracking for the nearest player while the local player holds the bomb.
 
 local Players = game:GetService("Players")
@@ -28,7 +28,6 @@ local CAMERA_TOUCH_MIN_X_FRACTION = 0.28
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
 local REACTION_SHARP_TURN_THRESHOLD_DEGREES = 50
 local REACTION_TRIGGER_COOLDOWN = 0.16
-local BOMB_OWNER_RESET_GAP = 1.20
 
 -- 30% keeps the former response time. 70% reacts in 0.04-0.10 s,
 -- with a bias toward the lower end of that range.
@@ -116,10 +115,6 @@ local state = {
 	reactionTimeMs = 0,
 	connections = {},
 	target = nil,
-	transferTarget = nil,
-	bombOwner = nil,
-	observedBombInstance = nil,
-	bombMissingSince = nil,
 	bomb = nil,
 	timerLabel = nil,
 	timerLastText = nil,
@@ -309,64 +304,6 @@ local function findOwnedBomb()
 	return findBombIn(Backpack)
 end
 
-local function findBombHolder()
-	for _, player in ipairs(Players:GetPlayers()) do
-		local bomb = findBombIn(player.Character)
-		if not bomb then
-			local backpack = player:FindFirstChildOfClass("Backpack")
-			bomb = findBombIn(backpack)
-		end
-		if bomb then
-			return player, bomb
-		end
-	end
-
-	return nil, nil
-end
-
-local function updateBombOwnership()
-	local holder, bomb = findBombHolder()
-	local now = os.clock()
-
-	if holder then
-		state.bombMissingSince = nil
-		local isNewBomb = state.observedBombInstance ~= nil
-			and bomb ~= state.observedBombInstance
-		if not state.bombOwner or isNewBomb then
-			-- The first observed holder establishes the round baseline. This is
-			-- intentionally not treated as a pass, so spawning with the bomb
-			-- never creates an Auto Camera target.
-			state.bombOwner = holder
-			state.observedBombInstance = bomb
-			state.transferTarget = nil
-		elseif holder ~= state.bombOwner then
-			local previousHolder = state.bombOwner
-			if holder == LocalPlayer and previousHolder ~= LocalPlayer then
-				state.transferTarget = previousHolder
-			elseif previousHolder == LocalPlayer and holder ~= LocalPlayer then
-				state.transferTarget = holder
-			end
-			state.bombOwner = holder
-		end
-		state.observedBombInstance = bomb
-
-		state.bomb = holder == LocalPlayer and bomb or nil
-		return
-	end
-
-	state.bomb = nil
-	if not state.bombMissingSince then
-		state.bombMissingSince = now
-	elseif (now - state.bombMissingSince) >= BOMB_OWNER_RESET_GAP then
-		-- A short no-owner gap happens naturally during a pass. A longer gap
-		-- means the round/bomb ended, so the next holder is a fresh baseline.
-		state.bombOwner = nil
-		state.observedBombInstance = nil
-		state.transferTarget = nil
-		state.target = nil
-	end
-end
-
 local function findTimerLabel(bomb)
 	if not bomb then
 		return nil
@@ -496,18 +433,30 @@ local function playersAreTeammates(otherPlayer)
 	return false
 end
 
-local function getTransferTarget()
-	local player = state.transferTarget
-	if not player or player == LocalPlayer or player.Parent ~= Players then
-		return nil
-	end
-	if not getCharacterRoot(player.Character) then
+local function findNearestPlayer()
+	local localRoot = getCharacterRoot(LocalPlayer.Character)
+	if not localRoot then
 		return nil
 	end
 
-	-- Team Check remains stored in its switch, unchanged for now. Transfer
-	-- pairing takes precedence until the game's real team signal is mapped.
-	return player
+	local nearestPlayer = nil
+	local nearestDistance = math.huge
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			local root = getCharacterRoot(player.Character)
+			if root then
+				local distance = (root.Position - localRoot.Position).Magnitude
+				if distance < nearestDistance then
+					nearestDistance = distance
+					nearestPlayer = player
+				end
+			end
+		end
+	end
+
+	-- Team Check remains outside target selection until its game-specific
+	-- signal is mapped, preventing it from blocking every nearby player.
+	return nearestPlayer
 end
 
 local function randomizeAimTarget()
@@ -1496,9 +1445,8 @@ local function toggleAutoCamera()
 	updateButtonText()
 	resetCameraTrackingState(true)
 	if state.enabled then
-		updateBombOwnership()
 		updateRemainingTime()
-		state.target = getTransferTarget()
+		state.target = findNearestPlayer()
 		showNotice("Auto Camera enabled")
 	else
 		state.target = nil
@@ -1751,7 +1699,6 @@ connect(RunService.Heartbeat, function(deltaTime)
 	bombAccumulator = bombAccumulator + deltaTime
 	if bombAccumulator >= BOMB_UPDATE_INTERVAL then
 		bombAccumulator = bombAccumulator % BOMB_UPDATE_INTERVAL
-		updateBombOwnership()
 		updateRemainingTime()
 	end
 
@@ -1760,7 +1707,7 @@ connect(RunService.Heartbeat, function(deltaTime)
 		targetAccumulator = targetAccumulator % TARGET_UPDATE_INTERVAL
 		local nextTarget = nil
 		if state.enabled and state.bomb then
-			nextTarget = getTransferTarget()
+			nextTarget = findNearestPlayer()
 		end
 		if nextTarget ~= state.target then
 			state.target = nextTarget
@@ -1804,20 +1751,13 @@ RunService:BindToRenderStep(
 )
 
 connect(LocalPlayer.CharacterAdded, function()
-	state.bombOwner = nil
-	state.observedBombInstance = nil
-	state.bombMissingSince = nil
-	state.transferTarget = nil
 	resetTimerState(nil, nil)
 	state.target = nil
 	resetCameraTrackingState(true)
 end)
 
 connect(Players.PlayerRemoving, function(player)
-	if player == state.target or player == state.transferTarget then
-		if player == state.transferTarget then
-			state.transferTarget = nil
-		end
+	if player == state.target then
 		state.target = nil
 		resetCameraTrackingState(false)
 	end
@@ -1857,7 +1797,6 @@ end
 
 updateButtonText()
 setMainButtonVisualHidden(state.buttonHidden, true)
-updateBombOwnership()
 updateRemainingTime()
-state.target = getTransferTarget()
+state.target = findNearestPlayer()
 print("[Cerber W Auto Camera] loaded")
