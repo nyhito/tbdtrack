@@ -1,5 +1,5 @@
 -- AutoTrackCam - Cerber W Mobile
--- Camera-only tracking for the nearest player while the local player holds the bomb.
+-- Camera-only tracking. Locks the nearest eligible player once per bomb cycle.
 
 local Players = game:GetService("Players")
 local TweenService = game:GetService("TweenService")
@@ -20,7 +20,9 @@ local TARGET_UPDATE_INTERVAL = 0.10
 local BOMB_UPDATE_INTERVAL = 0.05
 local DRAG_HOLD_TIME = 0.50
 
-local TRACK_HORIZONTAL_OFFSET_DEGREES = 45
+-- The imported debug camera is centred on the locked player. The native
+-- CameraModule is still free to move horizontally inside this range.
+local TRACK_HORIZONTAL_OFFSET_DEGREES = 0
 local CAMERA_MIN_TRACK_ANGLE_DEGREES = -60
 local CAMERA_MAX_TRACK_ANGLE_DEGREES = 60
 local CAMERA_MIN_MANUAL_OFFSET_DEGREES = CAMERA_MIN_TRACK_ANGLE_DEGREES
@@ -30,17 +32,12 @@ local CAMERA_MAX_MANUAL_OFFSET_DEGREES = CAMERA_MAX_TRACK_ANGLE_DEGREES
 local CAMERA_INPUT_NOISE_THRESHOLD_DEGREES = 0.01
 local CAMERA_INPUT_MAX_DELTA_DEGREES = 60
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
-local REACTION_SHARP_TURN_THRESHOLD_DEGREES = 50
-local REACTION_TRIGGER_COOLDOWN = 0.16
-
--- 30% keeps the former response time. 70% reacts in 0.04-0.10 s,
--- with a bias toward the lower end of that range.
-local CAMERA_ENGAGE_SLOW_CHANCE = 0.30
-local CAMERA_ENGAGE_SLOW_MIN = 0.18
-local CAMERA_ENGAGE_SLOW_MAX = 0.28
-local CAMERA_ENGAGE_FAST_MIN = 0.04
-local CAMERA_ENGAGE_FAST_MAX = 0.10
-local CAMERA_ENGAGE_FAST_BIAS_POWER = 2.2
+local CAMERA_CLOSE_TARGET_RADIUS = 2.25
+local CAMERA_CLOSE_DIRECTION_SMOOTH_SPEED = 12
+local CAMERA_CLOSE_DIRECTION_SETTLE_DEGREES = 0.5
+local CAMERA_ENGAGE_DURATION_MIN = 0.05
+local CAMERA_ENGAGE_DURATION_MAX = 0.10
+local TARGET_HISTORY_PADDING_SECONDS = 0.08
 
 local AIM_MIN_ABSOLUTE_OFFSET = 0.14
 local AIM_NEAR_MAX_OFFSET = 0.58
@@ -119,6 +116,9 @@ local state = {
 	reactionTimeMs = 0,
 	connections = {},
 	target = nil,
+	targetLockBomb = nil,
+	targetLockAcquired = false,
+	targetLockRetryAt = 0,
 	bomb = nil,
 	timerLabel = nil,
 	timerLastText = nil,
@@ -133,8 +133,12 @@ local state = {
 	cameraLastOutputForward = nil,
 	cameraEngageActive = false,
 	cameraEngageElapsed = 0,
-	cameraEngageDuration = CAMERA_ENGAGE_SLOW_MIN,
+	cameraEngageDuration = CAMERA_ENGAGE_DURATION_MIN,
 	cameraEngageStartCFrame = nil,
+	cameraEngageStartForward = nil,
+	cameraTrackedTargetDirection = nil,
+	cameraCloseDirectionRecovery = false,
+	targetPositionHistory = {},
 	aimTargetOffset = (RandomGenerator:NextInteger(0, 1) == 0 and -1 or 1)
 		* RandomGenerator:NextNumber(0.2, 0.5),
 	aimAppliedOffset = 0.24,
@@ -178,17 +182,10 @@ local function connect(signal, callback)
 end
 
 local function getCameraEngageDuration()
-	if RandomGenerator:NextNumber(0, 1) < CAMERA_ENGAGE_SLOW_CHANCE then
-		return RandomGenerator:NextNumber(
-			CAMERA_ENGAGE_SLOW_MIN,
-			CAMERA_ENGAGE_SLOW_MAX
-		)
-	end
-
-	local sample = RandomGenerator:NextNumber(0, 1)
-	local biasedSample = sample ^ CAMERA_ENGAGE_FAST_BIAS_POWER
-	return CAMERA_ENGAGE_FAST_MIN
-		+ ((CAMERA_ENGAGE_FAST_MAX - CAMERA_ENGAGE_FAST_MIN) * biasedSample)
+	return RandomGenerator:NextNumber(
+		CAMERA_ENGAGE_DURATION_MIN,
+		CAMERA_ENGAGE_DURATION_MAX
+	)
 end
 
 local function getSmoothAlpha(speed, deltaTime)
@@ -420,22 +417,109 @@ local function updateRemainingTime()
 	return state.remainingTime
 end
 
-local function playersAreTeammates(otherPlayer)
-	if not state.teamCheckEnabled then
+local function readInstanceProperty(instance, propertyName)
+	local success, value = pcall(function()
+		return instance[propertyName]
+	end)
+	return success and value or nil
+end
+
+local function colorLooksTeamGreen(color)
+	return typeof(color) == "Color3"
+		and color.G >= 0.30
+		and color.G >= (color.R + 0.12)
+		and color.G >= (color.B + 0.06)
+end
+
+local function isVisibleGreenChamVisual(instance)
+	if instance:IsA("Highlight") then
+		if readInstanceProperty(instance, "Enabled") == false then
+			return false
+		end
+
+		local fillVisible = (readInstanceProperty(instance, "FillTransparency") or 1)
+			< 0.98
+			and colorLooksTeamGreen(readInstanceProperty(instance, "FillColor"))
+		local outlineVisible = (readInstanceProperty(instance, "OutlineTransparency") or 1)
+			< 0.98
+			and colorLooksTeamGreen(readInstanceProperty(instance, "OutlineColor"))
+		return fillVisible or outlineVisible
+	end
+
+	local isAdornment = instance:IsA("SelectionBox")
+		or instance:IsA("BoxHandleAdornment")
+		or instance:IsA("SphereHandleAdornment")
+		or instance:IsA("CylinderHandleAdornment")
+		or instance:IsA("ConeHandleAdornment")
+		or instance:IsA("LineHandleAdornment")
+	if not isAdornment then
 		return false
 	end
 
-	local localTeam = LocalPlayer.Team
-	local otherTeam = otherPlayer.Team
-	if localTeam and otherTeam then
-		return localTeam == otherTeam
+	if readInstanceProperty(instance, "Visible") == false then
+		return false
+	end
+	local transparency = readInstanceProperty(instance, "Transparency")
+	if type(transparency) == "number" and transparency >= 0.98 then
+		return false
 	end
 
-	if not LocalPlayer.Neutral and not otherPlayer.Neutral then
-		return LocalPlayer.TeamColor == otherPlayer.TeamColor
+	return colorLooksTeamGreen(readInstanceProperty(instance, "Color3"))
+		or colorLooksTeamGreen(readInstanceProperty(instance, "SurfaceColor3"))
+end
+
+local function visualTargetsCharacter(visual, character)
+	if not visual or not character then
+		return false
+	end
+	if visual:IsDescendantOf(character) then
+		return true
+	end
+
+	local current = visual
+	while current and current ~= game do
+		local adornee = readInstanceProperty(current, "Adornee")
+		if typeof(adornee) == "Instance"
+			and (adornee == character or adornee:IsDescendantOf(character)) then
+			return true
+		end
+		current = current.Parent
 	end
 
 	return false
+end
+
+local function collectGreenChamsPlayers()
+	local markedPlayers = {}
+	local otherPlayers = {}
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			table.insert(otherPlayers, player)
+		end
+	end
+
+	local function inspectRoot(root)
+		if not root then
+			return
+		end
+		for _, descendant in ipairs(root:GetDescendants()) do
+			if isVisibleGreenChamVisual(descendant) then
+				for _, player in ipairs(otherPlayers) do
+					if not markedPlayers[player]
+						and visualTargetsCharacter(descendant, player.Character) then
+						markedPlayers[player] = true
+					end
+				end
+			end
+		end
+	end
+
+	-- A game Highlight is normally in Workspace, but some executors replicate
+	-- adornments beneath PlayerGui. Both locations are inspected only when a
+	-- new target is about to be locked, never every frame.
+	inspectRoot(workspace)
+	inspectRoot(PlayerGui)
+	return markedPlayers
 end
 
 local function findNearestPlayer()
@@ -444,10 +528,13 @@ local function findNearestPlayer()
 		return nil
 	end
 
+	local greenChamsPlayers = state.teamCheckEnabled
+		and collectGreenChamsPlayers()
+		or {}
 	local nearestPlayer = nil
 	local nearestDistance = math.huge
 	for _, player in ipairs(Players:GetPlayers()) do
-		if player ~= LocalPlayer then
+		if player ~= LocalPlayer and not greenChamsPlayers[player] then
 			local root = getCharacterRoot(player.Character)
 			if root then
 				local distance = (root.Position - localRoot.Position).Magnitude
@@ -459,8 +546,6 @@ local function findNearestPlayer()
 		end
 	end
 
-	-- Team Check remains outside target selection until its game-specific
-	-- signal is mapped, preventing it from blocking every nearby player.
 	return nearestPlayer
 end
 
@@ -715,7 +800,11 @@ local function resetCameraTrackingState(resetManualOffset)
 	state.cameraEngageActive = false
 	state.cameraEngageElapsed = 0
 	state.cameraEngageStartCFrame = nil
+	state.cameraEngageStartForward = nil
 	state.cameraLastOutputForward = nil
+	state.cameraTrackedTargetDirection = nil
+	state.cameraCloseDirectionRecovery = false
+	state.targetPositionHistory = {}
 	state.cameraLastTargetSamplePosition = nil
 	state.cameraLastTargetMoveDirection = nil
 	state.cameraLastAppliedTargetDirection = nil
@@ -737,7 +826,11 @@ local function beginCameraTracking()
 	state.cameraEngageElapsed = 0
 	state.cameraEngageDuration = getCameraEngageDuration()
 	state.cameraEngageStartCFrame = nil
+	state.cameraEngageStartForward = nil
 	state.cameraLastOutputForward = nil
+	state.cameraTrackedTargetDirection = nil
+	state.cameraCloseDirectionRecovery = false
+	state.targetPositionHistory = {}
 	state.cameraLastTargetSamplePosition = nil
 	state.cameraLastTargetMoveDirection = nil
 	state.cameraLastAppliedTargetDirection = nil
@@ -746,8 +839,52 @@ local function beginCameraTracking()
 	state.cameraPendingTurnFlick = false
 	state.cameraMicroPhaseA = RandomGenerator:NextNumber(0, math.pi * 2)
 	state.cameraMicroPhaseB = RandomGenerator:NextNumber(0, math.pi * 2)
-	randomizeAimTarget()
-	randomizeCameraBaseOffset()
+end
+
+local function getDelayedTargetPosition(targetRoot)
+	local now = os.clock()
+	local currentPosition = targetRoot.Position
+	local history = state.targetPositionHistory
+	table.insert(history, {
+		time = now,
+		position = currentPosition,
+	})
+
+	local delaySeconds = math.clamp(state.reactionTimeMs or 0, 0, 99) / 1000
+	-- Keep the full 99 ms window available even if the setting is changed
+	-- while tracking is already active.
+	local oldestNeededAt = now - 0.099 - TARGET_HISTORY_PADDING_SECONDS
+	while #history > 2 and history[2].time < oldestNeededAt do
+		table.remove(history, 1)
+	end
+
+	if delaySeconds <= 0 or #history == 1 then
+		return currentPosition
+	end
+
+	local delayedAt = now - delaySeconds
+	if delayedAt <= history[1].time then
+		return history[1].position
+	end
+
+	for index = 2, #history do
+		local previousSample = history[index - 1]
+		local nextSample = history[index]
+		if delayedAt <= nextSample.time then
+			local sampleSpan = math.max(
+				nextSample.time - previousSample.time,
+				0.000001
+			)
+			local alpha = math.clamp(
+				(delayedAt - previousSample.time) / sampleSpan,
+				0,
+				1
+			)
+			return previousSample.position:Lerp(nextSample.position, alpha)
+		end
+	end
+
+	return currentPosition
 end
 
 local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
@@ -756,17 +893,60 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 		return
 	end
 
-	local aimPosition = updateAimPosition(targetRoot, deltaTime)
-	local rawTargetDirection = getHorizontalUnit(aimPosition - localRoot.Position)
-	if not rawTargetDirection then
+	-- This is the centred camera from camera_track_debug. Reaction Time samples
+	-- the target's real position in the past instead of freezing only on turns.
+	local delayedTargetPosition = getDelayedTargetPosition(targetRoot)
+	local offset = delayedTargetPosition - localRoot.Position
+	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
+	local horizontalDistance = horizontalOffset.Magnitude
+	local rawTargetDirection = horizontalDistance > 0.001
+		and horizontalOffset.Unit
+		or nil
+	local towardTarget = rawTargetDirection
+		or state.cameraTrackedTargetDirection
+	if not towardTarget then
 		return
+	end
+
+	if rawTargetDirection then
+		local trackedDirection = state.cameraTrackedTargetDirection
+			or rawTargetDirection
+		local directionError = getSignedHorizontalAngle(
+			trackedDirection,
+			rawTargetDirection
+		)
+		local smoothCloseDirection = horizontalDistance
+			<= CAMERA_CLOSE_TARGET_RADIUS
+			or state.cameraCloseDirectionRecovery
+
+		if smoothCloseDirection then
+			local directionAlpha = getSmoothAlpha(
+				CAMERA_CLOSE_DIRECTION_SMOOTH_SPEED,
+				deltaTime
+			)
+			towardTarget = rotateHorizontalLeft(
+				trackedDirection,
+				directionError * directionAlpha
+			)
+			state.cameraCloseDirectionRecovery = horizontalDistance
+				<= CAMERA_CLOSE_TARGET_RADIUS
+				or math.abs(directionError)
+					> CAMERA_CLOSE_DIRECTION_SETTLE_DEGREES
+		else
+			towardTarget = rawTargetDirection
+			state.cameraCloseDirectionRecovery = false
+		end
+
+		state.cameraTrackedTargetDirection = towardTarget
+	else
+		state.cameraCloseDirectionRecovery = true
 	end
 
 	local focus = camera.Focus.Position
 	local defaultForward = getHorizontalUnit(focus - camera.CFrame.Position)
 	if state.cameraLastOutputForward and defaultForward then
-		-- Original first-ZIP behavior: CameraModule runs before this step. The
-		-- difference it produced is applied directly as the native drag input.
+		-- CameraModule runs before this step. Its delta is the player's native
+		-- horizontal drag, which stays responsive inside the -60..60 degree arc.
 		local inputDeltaDegrees = getSignedHorizontalAngle(
 			state.cameraLastOutputForward,
 			defaultForward
@@ -793,30 +973,12 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	)
 	state.cameraAppliedOffsetDegrees = manualOffset
 
-	local baseError, flickError, microError = updateCameraVariation(
-		targetRoot,
-		deltaTime
-	)
-
-	local targetDirection = rawTargetDirection
-	if os.clock() < state.cameraReactionUntil
-		and state.cameraReactionHeldDirection then
-		targetDirection = state.cameraReactionHeldDirection
-	else
-		state.cameraReactionHeldDirection = nil
-		state.cameraLastAppliedTargetDirection = rawTargetDirection
-	end
-
 	local trackAngle = math.clamp(
-		TRACK_HORIZONTAL_OFFSET_DEGREES
-			+ manualOffset
-			+ baseError
-			+ flickError
-			+ microError,
+		TRACK_HORIZONTAL_OFFSET_DEGREES + manualOffset,
 		CAMERA_MIN_TRACK_ANGLE_DEGREES,
 		CAMERA_MAX_TRACK_ANGLE_DEGREES
 	)
-	local limitedForward = rotateHorizontalLeft(targetDirection, trackAngle)
+	local limitedForward = rotateHorizontalLeft(towardTarget, trackAngle)
 
 	-- Keep the native zoom and vertical pitch. Only the horizontal direction
 	-- is guided, so the player can still move the camera vertically and zoom.
@@ -839,17 +1001,36 @@ local function updateTrackingCamera(localRoot, targetRoot, deltaTime)
 	if state.cameraEngageActive then
 		if not state.cameraEngageStartCFrame then
 			state.cameraEngageStartCFrame = camera.CFrame
+			state.cameraEngageStartForward = getHorizontalUnit(
+				focus - camera.CFrame.Position
+			) or limitedForward
 		end
 		state.cameraEngageElapsed = state.cameraEngageElapsed + deltaTime
 		local progress = state.cameraEngageElapsed
 			/ math.max(state.cameraEngageDuration, 0.001)
-		camera.CFrame = state.cameraEngageStartCFrame:Lerp(
-			desiredCameraCFrame,
-			getSmoothStep(progress)
+		local easedProgress = getSmoothStep(progress)
+		local startForward = state.cameraEngageStartForward
+			or limitedForward
+		local engageTurnDegrees = getSignedHorizontalAngle(
+			startForward,
+			limitedForward
+		)
+		local engageForward = rotateHorizontalLeft(
+			startForward,
+			engageTurnDegrees * easedProgress
+		)
+		local engageCameraPosition = focus
+			- (engageForward * horizontalRadius)
+			+ Vector3.new(0, verticalOffset, 0)
+		camera.CFrame = CFrame.lookAt(
+			engageCameraPosition,
+			focus,
+			Vector3.new(0, 1, 0)
 		)
 		if progress >= 1 then
 			state.cameraEngageActive = false
 			state.cameraEngageStartCFrame = nil
+			state.cameraEngageStartForward = nil
 		end
 	else
 		camera.CFrame = desiredCameraCFrame
@@ -1468,12 +1649,15 @@ local function toggleAutoCamera()
 	state.enabled = not state.enabled
 	updateButtonText()
 	resetCameraTrackingState(true)
+	state.target = nil
+	state.targetLockAcquired = false
+	state.targetLockRetryAt = 0
+	state.targetLockBomb = state.bomb
 	if state.enabled then
 		updateRemainingTime()
-		state.target = findNearestPlayer()
+		state.targetLockBomb = state.bomb
 		showNotice("Auto Camera enabled")
 	else
-		state.target = nil
 		showNotice("Auto Camera disabled")
 	end
 end
@@ -1587,11 +1771,7 @@ local function applyReactionTimeText()
 
 	state.reactionTimeMs = math.floor(math.clamp(value, 0, 99) + 0.5)
 	ReactionTimeBox.Text = tostring(state.reactionTimeMs) .. "ms"
-	if state.reactionTimeMs == 0 then
-		state.cameraReactionUntil = 0
-		state.cameraReactionHeldDirection = nil
-		state.cameraPendingTurnFlick = false
-	end
+	state.targetPositionHistory = {}
 	showNotice("Reaction time: " .. ReactionTimeBox.Text)
 end
 
@@ -1636,6 +1816,9 @@ end)
 connect(TeamCheckRow.Activated, function()
 	state.teamCheckEnabled = not state.teamCheckEnabled
 	state.target = nil
+	state.targetLockAcquired = false
+	state.targetLockRetryAt = 0
+	state.targetLockBomb = state.bomb
 	resetCameraTrackingState(false)
 	updateSwitchVisual(teamCheckSwitch, teamCheckKnob, state.teamCheckEnabled, false)
 	showNotice(state.teamCheckEnabled and "Team Check enabled" or "Team Check disabled")
@@ -1650,7 +1833,6 @@ connect(ReactionTimeBox.FocusLost, function()
 end)
 
 local bombAccumulator = BOMB_UPDATE_INTERVAL
-local targetAccumulator = TARGET_UPDATE_INTERVAL
 
 connect(RunService.Heartbeat, function(deltaTime)
 	if not state.alive then
@@ -1661,17 +1843,11 @@ connect(RunService.Heartbeat, function(deltaTime)
 	if bombAccumulator >= BOMB_UPDATE_INTERVAL then
 		bombAccumulator = bombAccumulator % BOMB_UPDATE_INTERVAL
 		updateRemainingTime()
-	end
-
-	targetAccumulator = targetAccumulator + deltaTime
-	if targetAccumulator >= TARGET_UPDATE_INTERVAL then
-		targetAccumulator = targetAccumulator % TARGET_UPDATE_INTERVAL
-		local nextTarget = nil
-		if state.enabled and state.bomb then
-			nextTarget = findNearestPlayer()
-		end
-		if nextTarget ~= state.target then
-			state.target = nextTarget
+		if state.bomb ~= state.targetLockBomb then
+			state.targetLockBomb = state.bomb
+			state.target = nil
+			state.targetLockAcquired = false
+			state.targetLockRetryAt = 0
 			resetCameraTrackingState(false)
 		end
 	end
@@ -1685,10 +1861,27 @@ RunService:BindToRenderStep(
 			return
 		end
 
-		local canTrack = state.enabled
+		local trackingWindowOpen = state.enabled
 			and state.bomb ~= nil
 			and state.remainingTime ~= nil
 			and state.remainingTime <= (state.startTime + 0.015)
+
+		-- Choose the nearest eligible player once, exactly when this bomb cycle
+		-- enters its tracking window. A closer passer-by cannot replace the lock.
+		if trackingWindowOpen
+			and not state.targetLockAcquired
+			and os.clock() >= state.targetLockRetryAt then
+			state.targetLockRetryAt = os.clock() + TARGET_UPDATE_INTERVAL
+			local lockedTarget = findNearestPlayer()
+			if lockedTarget then
+				state.target = lockedTarget
+				state.targetLockAcquired = true
+				resetCameraTrackingState(false)
+			end
+		end
+
+		local canTrack = trackingWindowOpen
+			and state.targetLockAcquired
 			and state.target ~= nil
 		if not canTrack then
 			if state.trackingActiveLastFrame then
@@ -1714,12 +1907,17 @@ RunService:BindToRenderStep(
 connect(LocalPlayer.CharacterAdded, function()
 	resetTimerState(nil, nil)
 	state.target = nil
+	state.targetLockBomb = nil
+	state.targetLockAcquired = false
+	state.targetLockRetryAt = 0
 	resetCameraTrackingState(true)
 end)
 
 connect(Players.PlayerRemoving, function(player)
 	if player == state.target then
 		state.target = nil
+		-- Keep targetLockAcquired true. The same bomb cycle never silently
+		-- switches to a different player after its one-time selection.
 		resetCameraTrackingState(false)
 	end
 end)
@@ -1759,5 +1957,5 @@ end
 updateButtonText()
 setMainButtonVisualHidden(state.buttonHidden, true)
 updateRemainingTime()
-state.target = findNearestPlayer()
+state.targetLockBomb = state.bomb
 print("[Cerber W Auto Camera] loaded")
