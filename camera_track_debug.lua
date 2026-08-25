@@ -277,6 +277,7 @@ ScreenGui.ResetOnSpawn = false
 ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.DisplayOrder = 1000
 ScreenGui.IgnoreGuiInset = true
+ScreenGui.Enabled = true
 pcall(function()
 	ScreenGui.ScreenInsets = Enum.ScreenInsets.None
 	ScreenGui.ClipToDeviceSafeArea = false
@@ -296,6 +297,7 @@ MobileButton.TextSize = 17
 MobileButton.TextWrapped = true
 MobileButton.TextStrokeTransparency = 1
 MobileButton.Active = true
+MobileButton.Visible = true
 MobileButton.Selectable = false
 MobileButton.ZIndex = 10
 MobileButton.Parent = ScreenGui
@@ -1536,6 +1538,46 @@ local function clampButtonToScreen(position)
 	)
 	return UDim2.new(0, x, 0, y)
 end
+
+-- O botao deve continuar disponivel mesmo quando um spoofer troca o tipo de
+-- dispositivo reportado e o Roblox recalcula o estado/tamanho das interfaces.
+local buttonVisibilityGuardBusy = false
+local function keepTrackButtonAvailable()
+	if not state.alive or buttonVisibilityGuardBusy then
+		return
+	end
+
+	buttonVisibilityGuardBusy = true
+	pcall(function()
+		if ScreenGui.Parent ~= PlayerGui then
+			ScreenGui.Parent = PlayerGui
+		end
+		ScreenGui.Enabled = true
+
+		if MobileButton.Parent ~= ScreenGui then
+			MobileButton.Parent = ScreenGui
+		end
+		MobileButton.Visible = true
+		MobileButton.Active = true
+		MobileButton.Position = clampButtonToScreen(MobileButton.Position)
+	end)
+	buttonVisibilityGuardBusy = false
+end
+
+connect(ScreenGui:GetPropertyChangedSignal("Enabled"), keepTrackButtonAvailable)
+connect(MobileButton:GetPropertyChangedSignal("Visible"), keepTrackButtonAvailable)
+connect(MobileButton:GetPropertyChangedSignal("Active"), keepTrackButtonAvailable)
+connect(ScreenGui:GetPropertyChangedSignal("AbsoluteSize"), function()
+	task.defer(keepTrackButtonAvailable)
+end)
+connect(ScreenGui.AncestryChanged, function()
+	task.defer(keepTrackButtonAvailable)
+end)
+connect(MobileButton.AncestryChanged, function()
+	task.defer(keepTrackButtonAvailable)
+end)
+
+keepTrackButtonAvailable()
 
 local activeInput = nil
 local dragStart = nil
