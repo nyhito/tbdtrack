@@ -81,6 +81,9 @@ local CAMERA_FLICK_TURN_THRESHOLD_DEGREES = 26
 local CAMERA_FLICK_SAMPLE_DISTANCE = 0.08
 local CAMERA_FLICK_COOLDOWN = 0.18
 local CAMERA_MIN_HORIZONTAL_RADIUS = 0.08
+local CAMERA_CLOSE_TARGET_RADIUS = 2.25
+local CAMERA_CLOSE_DIRECTION_SMOOTH_SPEED = 12
+local CAMERA_CLOSE_DIRECTION_SETTLE_DEGREES = 0.5
 local CAMERA_ENGAGE_DURATION_MIN = 0.18
 local CAMERA_ENGAGE_DURATION_MAX = 0.28
 local CAMERA_ENGAGE_SLOW_CHANCE = 0.3
@@ -235,8 +238,11 @@ local state = {
 	cameraEngageElapsed = 0,
 	cameraEngageDuration = CAMERA_ENGAGE_DURATION_MIN,
 	cameraEngageStartCFrame = nil,
+	cameraEngageStartForward = nil,
 	trackingActiveLastFrame = false,
 	cameraLastOutputForward = nil,
+	cameraTrackedTargetDirection = nil,
+	cameraCloseDirectionRecovery = false,
 	botAppearSequenceTarget = nil,
 	botAppearWaitUntil = 0,
 	botAppearEngageDuration = BOT_APPEAR_ENGAGE_DURATION_MIN,
@@ -615,7 +621,10 @@ local function releaseTrackingControl()
 	state.cameraEngageActive = false
 	state.cameraEngageElapsed = 0
 	state.cameraEngageStartCFrame = nil
+	state.cameraEngageStartForward = nil
 	state.cameraLastOutputForward = nil
+	state.cameraTrackedTargetDirection = nil
+	state.cameraCloseDirectionRecovery = false
 	state.trackingActiveLastFrame = false
 end
 
@@ -662,7 +671,10 @@ local function beginBotSequence(target, targetRoot, waitBeforeTurning)
 	state.cameraEngageActive = false
 	state.cameraEngageElapsed = 0
 	state.cameraEngageStartCFrame = nil
+	state.cameraEngageStartForward = nil
 	state.cameraLastOutputForward = nil
+	state.cameraTrackedTargetDirection = nil
+	state.cameraCloseDirectionRecovery = false
 	state.trackingActiveLastFrame = false
 end
 
@@ -1051,11 +1063,51 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 	-- existindo apenas no movimento temporario e nao desloca este teste.
 	local offset = targetRoot.Position - localRoot.Position
 	local horizontalOffset = Vector3.new(offset.X, 0, offset.Z)
-	if horizontalOffset.Magnitude <= 0.001 then
+	local horizontalDistance = horizontalOffset.Magnitude
+	local rawTargetDirection = horizontalDistance > 0.001
+		and horizontalOffset.Unit
+		or nil
+	local towardTarget = rawTargetDirection
+		or state.cameraTrackedTargetDirection
+	if not towardTarget then
 		return
 	end
 
-	local towardTarget = horizontalOffset.Unit
+	if rawTargetDirection then
+		local trackedDirection = state.cameraTrackedTargetDirection
+			or rawTargetDirection
+		local directionError = getSignedHorizontalAngle(
+			trackedDirection,
+			rawTargetDirection
+		)
+		local smoothCloseDirection = horizontalDistance
+			<= CAMERA_CLOSE_TARGET_RADIUS
+			or state.cameraCloseDirectionRecovery
+
+		if smoothCloseDirection then
+			local directionAlpha = getSmoothAlpha(
+				CAMERA_CLOSE_DIRECTION_SMOOTH_SPEED,
+				deltaTime
+			)
+			towardTarget = rotateHorizontalLeft(
+				trackedDirection,
+				directionError * directionAlpha
+			)
+			state.cameraCloseDirectionRecovery = horizontalDistance
+				<= CAMERA_CLOSE_TARGET_RADIUS
+				or math.abs(directionError)
+					> CAMERA_CLOSE_DIRECTION_SETTLE_DEGREES
+		else
+			towardTarget = rawTargetDirection
+			state.cameraCloseDirectionRecovery = false
+		end
+
+		state.cameraTrackedTargetDirection = towardTarget
+	else
+		-- Quando os dois roots se sobrepoem, a direcao normalizada deixa de ser
+		-- confiavel. Mantem a ultima direcao valida ate eles se separarem.
+		state.cameraCloseDirectionRecovery = true
+	end
 
 	-- A CameraModule do Roblox roda antes deste passo. Comparamos a direcao que
 	-- ela produziu com a nossa ultima saida para recuperar o arraste horizontal
@@ -1124,17 +1176,36 @@ local function updateTrackingCamera(localRoot, targetRoot, _aimPosition, deltaTi
 	if state.cameraEngageActive then
 		if not state.cameraEngageStartCFrame then
 			state.cameraEngageStartCFrame = camera.CFrame
+			state.cameraEngageStartForward = getHorizontalUnit(
+				focus - camera.CFrame.Position
+			) or limitedForward
 		end
 		state.cameraEngageElapsed = state.cameraEngageElapsed + deltaTime
 		local progress = state.cameraEngageElapsed
 			/ math.max(state.cameraEngageDuration, 0.001)
-		camera.CFrame = state.cameraEngageStartCFrame:Lerp(
-			desiredCameraCFrame,
-			getSmoothStep(progress)
+		local easedProgress = getSmoothStep(progress)
+		local startForward = state.cameraEngageStartForward
+			or limitedForward
+		local engageTurnDegrees = getSignedHorizontalAngle(
+			startForward,
+			limitedForward
+		)
+		local engageForward = rotateHorizontalLeft(
+			startForward,
+			engageTurnDegrees * easedProgress
+		)
+		local engageCameraPosition = focus
+			- (engageForward * horizontalRadius)
+			+ Vector3.new(0, verticalOffset, 0)
+		camera.CFrame = CFrame.lookAt(
+			engageCameraPosition,
+			focus,
+			Vector3.new(0, 1, 0)
 		)
 		if progress >= 1 then
 			state.cameraEngageActive = false
 			state.cameraEngageStartCFrame = nil
+			state.cameraEngageStartForward = nil
 		end
 	else
 		camera.CFrame = desiredCameraCFrame
@@ -1332,6 +1403,7 @@ local function movementStep(deltaTime)
 			state.cameraEngageActive = false
 			state.cameraEngageElapsed = 0
 			state.cameraEngageStartCFrame = nil
+			state.cameraEngageStartForward = nil
 			state.cameraLastOutputForward = nil
 			state.trackingActiveLastFrame = false
 			return
@@ -1346,6 +1418,7 @@ local function movementStep(deltaTime)
 		state.cameraEngageActive = true
 		state.cameraEngageElapsed = 0
 		state.cameraEngageStartCFrame = nil
+		state.cameraEngageStartForward = nil
 		state.cameraLastOutputForward = nil
 		state.cameraEngageDuration = state.botSequencePhase == "engaging"
 			and state.botAppearEngageDuration
@@ -1416,6 +1489,7 @@ local function toggleTrack()
 		state.cameraEngageActive = false
 		state.cameraEngageElapsed = 0
 		state.cameraEngageStartCFrame = nil
+		state.cameraEngageStartForward = nil
 		state.cameraLastOutputForward = nil
 		state.trackingActiveLastFrame = false
 		state.hasBomb = playerHasBomb()
